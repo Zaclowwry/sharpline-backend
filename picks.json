@@ -1,0 +1,25 @@
+{
+  "updatedAt": "2026-03-27T00:00:00.000Z",
+  "picks": {
+    "nba": [
+      {"badge":"🥉 VALUE BET","color":"#CD7F32","game":"🏀 NBA · Picks loading...","name":"Check back shortly","odds":"-110","conf":55,"free":true,"analysis":"Our picks engine is fetching the latest data. Check back in a few minutes."},
+      {"badge":"🥇 BEST BET","color":"#FFD700","game":"🏀 NBA · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"-150","conf":70,"free":false,"analysis":""},
+      {"badge":"🥈 STRONG PLAY","color":"#C0C0C0","game":"🏀 NBA · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"+110","conf":60,"free":false,"analysis":""}
+    ],
+    "nhl": [
+      {"badge":"🥉 VALUE BET","color":"#CD7F32","game":"🏒 NHL · Picks loading...","name":"Check back shortly","odds":"-110","conf":55,"free":true,"analysis":"Our picks engine is fetching the latest data. Check back in a few minutes."},
+      {"badge":"🥇 BEST BET","color":"#FFD700","game":"🏒 NHL · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"-150","conf":70,"free":false,"analysis":""},
+      {"badge":"🥈 STRONG PLAY","color":"#C0C0C0","game":"🏒 NHL · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"+110","conf":60,"free":false,"analysis":""}
+    ],
+    "ncaamb": [
+      {"badge":"🥉 VALUE BET","color":"#CD7F32","game":"🎓 NCAAB · Picks loading...","name":"Check back shortly","odds":"-110","conf":55,"free":true,"analysis":"Our picks engine is fetching the latest data. Check back in a few minutes."},
+      {"badge":"🥇 BEST BET","color":"#FFD700","game":"🎓 NCAAB · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"-150","conf":70,"free":false,"analysis":""},
+      {"badge":"🥈 STRONG PLAY","color":"#C0C0C0","game":"🎓 NCAAB · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"+110","conf":60,"free":false,"analysis":""}
+    ],
+    "mlb": [
+      {"badge":"🥉 VALUE BET","color":"#CD7F32","game":"⚾ MLB · Picks loading...","name":"Check back shortly","odds":"-110","conf":55,"free":true,"analysis":"Our picks engine is fetching the latest data. Check back in a few minutes."},
+      {"badge":"🥇 BEST BET","color":"#FFD700","game":"⚾ MLB · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"-150","conf":70,"free":false,"analysis":""},
+      {"badge":"🥈 STRONG PLAY","color":"#C0C0C0","game":"⚾ MLB · Picks loading...","name":"Pro Pick — Upgrade to unlock","odds":"+110","conf":60,"free":false,"analysis":""}
+    ]
+  }
+}
