@@ -11,16 +11,24 @@ const ODDS_API_KEY = 'd7c503fe973b7bbe8efddd2574efe960';
 
 const SPORTS = {
   nba: 'basketball_nba',
+  mlb: 'baseball_mlb',
   nhl: 'icehockey_nhl',
-  ncaamb: 'basketball_ncaab',
-  mlb: 'baseball_mlb'
+  ufc: 'mma_mixed_martial_arts'
 };
 
 const SPORT_LABELS = {
   nba: '🏀 NBA',
+  mlb: '⚾ MLB',
   nhl: '🏒 NHL',
-  ncaamb: '🎓 NCAAB',
-  mlb: '⚾ MLB'
+  ufc: '🥊 UFC'
+};
+
+const NEXT_UFC_EVENT = {
+  name: 'UFC 314',
+  date: 'Saturday, April 12, 2026',
+  mainEvent: 'Charles Oliveira vs Arman Tsarukyan',
+  coMain: 'Paige VanZant vs Kayla Harrison',
+  title: 'Lightweight Title Fight'
 };
 
 let cachedPicks = null;
@@ -47,6 +55,10 @@ app.get('/picks', async (req, res) => {
   }
 });
 
+app.get('/next-ufc', (req, res) => {
+  res.json(NEXT_UFC_EVENT);
+});
+
 async function fetchOdds(sportKey) {
   try {
     const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=h2h&oddsFormat=american`;
@@ -64,7 +76,7 @@ function americanToImpliedProb(odds) {
 }
 
 function getBestOdds(game) {
-  if(!game.bookmakers || game.bookmakers.length === 0) return null;
+  if(!game.bookmakers || game.bookmakers.length < 2) return null;
   let homeOdds = [], awayOdds = [];
   game.bookmakers.forEach(bm => {
     const h2h = bm.markets.find(m => m.key === 'h2h');
@@ -101,21 +113,72 @@ function generateAnalysis(pick) {
 
 async function generatePicks() {
   const allPicks = {};
+  const now = new Date();
+
   for(const [sport, sportKey] of Object.entries(SPORTS)) {
+    if(sport === 'ufc') {
+      const games = await fetchOdds(sportKey);
+      const upcomingFights = games.filter(game => {
+        const gameTime = new Date(game.commence_time);
+        const daysUntil = (gameTime - now) / 1000 / 60 / 60 / 24;
+        return gameTime > now && daysUntil <= 7 && game.bookmakers && game.bookmakers.length >= 2;
+      });
+
+      if(upcomingFights.length === 0) {
+        allPicks['ufc'] = { noEvent: true, nextEvent: NEXT_UFC_EVENT };
+        continue;
+      }
+
+      const picks = [];
+      upcomingFights.forEach(game => {
+        const pick = getBestOdds(game);
+        if(pick) picks.push({...pick, sport:'ufc'});
+      });
+
+      picks.sort((a,b) => b.confidence - a.confidence);
+      const top3 = picks.slice(0,3);
+      const badges = ['🥇 BEST BET','🥈 STRONG PLAY','🥉 VALUE BET'];
+      const colors = ['#FFD700','#C0C0C0','#CD7F32'];
+      allPicks['ufc'] = top3.map((pick,i) => ({
+        badge: badges[i],
+        color: colors[i],
+        game: `🥊 UFC · ${pick.team} vs ${pick.opponent}`,
+        name: `${pick.team} ML`,
+        odds: formatOdds(pick.odds),
+        conf: pick.confidence,
+        free: i === 2,
+        analysis: generateAnalysis(pick)
+      }));
+      continue;
+    }
+
     const games = await fetchOdds(sportKey);
     if(!games || games.length === 0) {
       allPicks[sport] = getDefaultPicksForSport(sport);
       continue;
     }
+
+    const futureGames = games.filter(game => {
+      const gameTime = new Date(game.commence_time);
+      return gameTime > now && game.bookmakers && game.bookmakers.length >= 2;
+    });
+
+    if(futureGames.length === 0) {
+      allPicks[sport] = getDefaultPicksForSport(sport);
+      continue;
+    }
+
     const picks = [];
-    games.forEach(game => {
+    futureGames.forEach(game => {
       const pick = getBestOdds(game);
       if(pick) picks.push({...pick, sport});
     });
+
     if(picks.length === 0) {
       allPicks[sport] = getDefaultPicksForSport(sport);
       continue;
     }
+
     picks.sort((a,b) => b.confidence - a.confidence);
     const top3 = picks.slice(0,3);
     const badges = ['🥇 BEST BET','🥈 STRONG PLAY','🥉 VALUE BET'];
@@ -136,15 +199,18 @@ async function generatePicks() {
 
 function getDefaultPicksForSport(sport) {
   return [
-    {badge:'🥉 VALUE BET',color:'#CD7F32',game:`${SPORT_LABELS[sport]} · No games today`,name:'Check back tomorrow',odds:'-110',conf:55,free:true,analysis:'No games available for this sport today.'},
-    {badge:'🥇 BEST BET',color:'#FFD700',game:`${SPORT_LABELS[sport]} · No games today`,name:'Pro Pick',odds:'-150',conf:70,free:false,analysis:''},
-    {badge:'🥈 STRONG PLAY',color:'#C0C0C0',game:`${SPORT_LABELS[sport]} · No games today`,name:'Pro Pick',odds:'+110',conf:60,free:false,analysis:''}
+    {badge:'🥉 VALUE BET',color:'#CD7F32',game:`${SPORT_LABELS[sport]} · No games available`,name:'Check back soon',odds:'-110',conf:55,free:true,analysis:'No games with betting lines available right now. Check back later today.'},
+    {badge:'🥇 BEST BET',color:'#FFD700',game:`${SPORT_LABELS[sport]} · No games available`,name:'Pro Pick',odds:'-150',conf:70,free:false,analysis:''},
+    {badge:'🥈 STRONG PLAY',color:'#C0C0C0',game:`${SPORT_LABELS[sport]} · No games available`,name:'Pro Pick',odds:'+110',conf:60,free:false,analysis:''}
   ];
 }
 
 function getDefaultPicks() {
   const picks = {};
-  Object.keys(SPORTS).forEach(sport => { picks[sport] = getDefaultPicksForSport(sport); });
+  Object.keys(SPORTS).forEach(sport => {
+    if(sport === 'ufc') picks[sport] = { noEvent: true, nextEvent: NEXT_UFC_EVENT };
+    else picks[sport] = getDefaultPicksForSport(sport);
+  });
   return picks;
 }
 
