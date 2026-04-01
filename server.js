@@ -7,7 +7,7 @@ app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
-const ODDS_API_KEY = 'd7c503fe973b7bbe8efddd2574efe960';
+const ODDS_API_KEY = '2033e71d5b6784b9352bfa561db1a576';
 
 const SPORTS = {
   nba: 'basketball_nba',
