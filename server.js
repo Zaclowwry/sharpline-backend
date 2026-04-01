@@ -55,17 +55,14 @@ app.get('/picks', async (req, res) => {
   }
 });
 
-app.get('/next-ufc', (req, res) => {
-  res.json(NEXT_UFC_EVENT);
-});
-
-async function fetchOdds(sportKey) {
+async function fetchOdds(sportKey, markets) {
   try {
-    const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=h2h&oddsFormat=american`;
+    const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=${markets}&oddsFormat=american`;
     const res = await fetch(url);
     const data = await res.json();
     return Array.isArray(data) ? data : [];
   } catch(e) {
+    console.log(`Error fetching ${sportKey}:`, e.message);
     return [];
   }
 }
@@ -75,40 +72,185 @@ function americanToImpliedProb(odds) {
   return Math.abs(odds) / (Math.abs(odds) + 100);
 }
 
-function getBestOdds(game) {
-  if(!game.bookmakers || game.bookmakers.length < 2) return null;
-  let homeOdds = [], awayOdds = [];
-  game.bookmakers.forEach(bm => {
-    const h2h = bm.markets.find(m => m.key === 'h2h');
-    if(h2h) {
-      const home = h2h.outcomes.find(o => o.name === game.home_team);
-      const away = h2h.outcomes.find(o => o.name === game.away_team);
-      if(home) homeOdds.push(home.price);
-      if(away) awayOdds.push(away.price);
-    }
-  });
-  if(homeOdds.length === 0) return null;
-  const avgHome = homeOdds.reduce((a,b) => a+b,0) / homeOdds.length;
-  const avgAway = awayOdds.reduce((a,b) => a+b,0) / awayOdds.length;
-  const homeProb = americanToImpliedProb(avgHome);
-  const awayProb = americanToImpliedProb(avgAway);
-  if(homeProb >= awayProb) {
-    return { team: game.home_team, opponent: game.away_team, odds: Math.round(avgHome), confidence: Math.round(homeProb*100), isHome: true };
-  } else {
-    return { team: game.away_team, opponent: game.home_team, odds: Math.round(avgAway), confidence: Math.round(awayProb*100), isHome: false };
-  }
-}
-
 function formatOdds(odds) {
   return odds > 0 ? `+${odds}` : `${odds}`;
 }
 
-function generateAnalysis(pick) {
-  const conf = pick.confidence;
-  const location = pick.isHome ? 'at home' : 'on the road';
-  if(conf >= 80) return `${pick.team} is ${conf}% favored ${location}. One of the strongest lines on the board today — dominant favorite that sharp money is backing heavily.`;
-  if(conf >= 65) return `${pick.team} is ${conf}% favored ${location}. Solid edge here with consistent line movement in their favor. Strong play for today.`;
-  return `${pick.team} at ${formatOdds(pick.odds)} offers real value. At ${conf}% implied probability this is a smart value play with upside.`;
+function isGoodValue(odds) {
+  return odds > -200 && odds < 500;
+}
+
+function getAverageOdds(bookmakers, team, market) {
+  const odds = [];
+  bookmakers.forEach(bm => {
+    const m = bm.markets.find(x => x.key === market);
+    if(m) {
+      const outcome = m.outcomes.find(o => o.name === team);
+      if(outcome) odds.push(outcome.price);
+    }
+  });
+  if(odds.length === 0) return null;
+  return Math.round(odds.reduce((a,b) => a+b,0) / odds.length);
+}
+
+function getAveragePoint(bookmakers, team, market) {
+  const points = [];
+  bookmakers.forEach(bm => {
+    const m = bm.markets.find(x => x.key === market);
+    if(m) {
+      const outcome = m.outcomes.find(o => o.name === team);
+      if(outcome && outcome.point !== undefined) points.push(outcome.point);
+    }
+  });
+  if(points.length === 0) return null;
+  return Math.round((points.reduce((a,b) => a+b,0) / points.length) * 10) / 10;
+}
+
+function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome) {
+  const location = isHome ? 'at home' : 'on the road';
+  const formattedOdds = formatOdds(odds);
+
+  if(pickType === 'h2h') {
+    if(conf >= 75) return `${team} is ${conf}% favored ${location}. One of the strongest moneylines on the board — sharp money is backing this heavily.`;
+    if(conf >= 65) return `${team} is ${conf}% favored ${location}. Solid edge with consistent line movement in their favor. Strong play today.`;
+    return `${team} at ${formattedOdds} offers real value ${location}. At ${conf}% confidence this is a smart play with good upside.`;
+  }
+
+  if(pickType === 'spreads') {
+    if(conf >= 75) return `${team} covering ${point > 0 ? '+' : ''}${point} is one of the strongest spread plays today. Sharp money is heavily on this line.`;
+    if(conf >= 65) return `${team} ${point > 0 ? '+' : ''}${point} is a solid spread play. Line movement supports this pick strongly.`;
+    return `${team} ${point > 0 ? '+' : ''}${point} at ${formattedOdds} offers value. Good spot to fade the public here.`;
+  }
+
+  if(pickType === 'totals') {
+    const direction = team === 'Over' ? 'over' : 'under';
+    if(conf >= 75) return `The ${direction} ${point} is one of the strongest totals plays today. Pace and matchup data strongly support this.`;
+    if(conf >= 65) return `${direction.charAt(0).toUpperCase() + direction.slice(1)} ${point} is a solid play. Both teams' recent scoring trends support this line.`;
+    return `${direction.charAt(0).toUpperCase() + direction.slice(1)} ${point} at ${formattedOdds} offers value. Situational spots favor this total.`;
+  }
+
+  return `Strong play — ${conf}% confidence with good value at ${formattedOdds}.`;
+}
+
+async function getPicksForSport(sportKey, sportLabel) {
+  const now = new Date();
+  const allCandidates = [];
+
+  const [h2hGames, spreadGames, totalGames] = await Promise.all([
+    fetchOdds(sportKey, 'h2h'),
+    fetchOdds(sportKey, 'spreads'),
+    fetchOdds(sportKey, 'totals')
+  ]);
+
+  const futureH2h = h2hGames.filter(g => new Date(g.commence_time) > now && g.bookmakers && g.bookmakers.length >= 2);
+  const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && g.bookmakers && g.bookmakers.length >= 2);
+  const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && g.bookmakers && g.bookmakers.length >= 2);
+
+  futureH2h.forEach(game => {
+    [game.home_team, game.away_team].forEach(team => {
+      const odds = getAverageOdds(game.bookmakers, team, 'h2h');
+      if(!odds) return;
+      const conf = Math.round(americanToImpliedProb(odds) * 100);
+      if(conf < 60 || !isGoodValue(odds)) return;
+      const isHome = team === game.home_team;
+      const opponent = isHome ? game.away_team : game.home_team;
+      const valueScore = conf - Math.abs(odds) / 10;
+      allCandidates.push({
+        type: 'h2h',
+        label: 'ML',
+        game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+        name: `${team} ML`,
+        odds,
+        conf,
+        valueScore,
+        isHome,
+        team,
+        opponent,
+        analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome)
+      });
+    });
+  });
+
+  futureSpread.forEach(game => {
+    [game.home_team, game.away_team].forEach(team => {
+      const odds = getAverageOdds(game.bookmakers, team, 'spreads');
+      const point = getAveragePoint(game.bookmakers, team, 'spreads');
+      if(!odds || point === null) return;
+      const conf = Math.round(americanToImpliedProb(odds) * 100);
+      if(conf < 60 || !isGoodValue(odds)) return;
+      const isHome = team === game.home_team;
+      const opponent = isHome ? game.away_team : game.home_team;
+      const valueScore = conf - Math.abs(odds) / 10;
+      allCandidates.push({
+        type: 'spreads',
+        label: 'SPREAD',
+        game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+        name: `${team} ${point > 0 ? '+' : ''}${point}`,
+        odds,
+        conf,
+        valueScore,
+        isHome,
+        team,
+        opponent,
+        point,
+        analysis: generateAnalysis('spreads', team, opponent, conf, odds, point, isHome)
+      });
+    });
+  });
+
+  futureTotals.forEach(game => {
+    ['Over', 'Under'].forEach(direction => {
+      const odds = getAverageOdds(game.bookmakers, direction, 'totals');
+      const point = getAveragePoint(game.bookmakers, direction, 'totals');
+      if(!odds || point === null) return;
+      const conf = Math.round(americanToImpliedProb(odds) * 100);
+      if(conf < 60 || !isGoodValue(odds)) return;
+      const valueScore = conf - Math.abs(odds) / 10;
+      allCandidates.push({
+        type: 'totals',
+        label: 'TOTAL',
+        game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+        name: `${direction} ${point}`,
+        odds,
+        conf,
+        valueScore,
+        team: direction,
+        opponent: '',
+        point,
+        analysis: generateAnalysis('totals', direction, '', conf, odds, point, false)
+      });
+    });
+  });
+
+  if(allCandidates.length === 0) return null;
+
+  allCandidates.sort((a, b) => b.valueScore - a.valueScore);
+
+  const seen = new Set();
+  const unique = [];
+  for(const pick of allCandidates) {
+    const key = pick.game + pick.type;
+    if(!seen.has(key)) {
+      seen.add(key);
+      unique.push(pick);
+    }
+    if(unique.length >= 3) break;
+  }
+
+  const badges = ['🥇 BEST BET', '🥈 STRONG PLAY', '🥉 VALUE BET'];
+  const colors = ['#FFD700', '#C0C0C0', '#CD7F32'];
+
+  return unique.map((pick, i) => ({
+    badge: badges[i],
+    color: colors[i],
+    game: pick.game,
+    name: pick.name,
+    odds: formatOdds(pick.odds),
+    conf: pick.conf,
+    free: i === 2,
+    type: pick.label,
+    analysis: pick.analysis
+  }));
 }
 
 async function generatePicks() {
@@ -117,7 +259,7 @@ async function generatePicks() {
 
   for(const [sport, sportKey] of Object.entries(SPORTS)) {
     if(sport === 'ufc') {
-      const games = await fetchOdds(sportKey);
+      const games = await fetchOdds(sportKey, 'h2h');
       const upcomingFights = games.filter(game => {
         const gameTime = new Date(game.commence_time);
         const daysUntil = (gameTime - now) / 1000 / 60 / 60 / 24;
@@ -129,79 +271,56 @@ async function generatePicks() {
         continue;
       }
 
-      const picks = [];
+      const fights = [];
       upcomingFights.forEach(game => {
-        const pick = getBestOdds(game);
-        if(pick) picks.push({...pick, sport:'ufc'});
+        [game.home_team, game.away_team].forEach(team => {
+          const odds = getAverageOdds(game.bookmakers, team, 'h2h');
+          if(!odds) return;
+          const conf = Math.round(americanToImpliedProb(odds) * 100);
+          if(conf < 55 || !isGoodValue(odds)) return;
+          const valueScore = conf - Math.abs(odds) / 10;
+          const opponent = team === game.home_team ? game.away_team : game.home_team;
+          fights.push({
+            game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`,
+            name: `${team} ML`,
+            odds, conf, valueScore,
+            analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, false)
+          });
+        });
       });
 
-      picks.sort((a,b) => b.confidence - a.confidence);
-      const top3 = picks.slice(0,3);
+      fights.sort((a,b) => b.valueScore - a.valueScore);
+      const top3 = fights.slice(0,3);
       const badges = ['🥇 BEST BET','🥈 STRONG PLAY','🥉 VALUE BET'];
       const colors = ['#FFD700','#C0C0C0','#CD7F32'];
-      allPicks['ufc'] = top3.map((pick,i) => ({
-        badge: badges[i],
-        color: colors[i],
-        game: `🥊 UFC · ${pick.team} vs ${pick.opponent}`,
-        name: `${pick.team} ML`,
-        odds: formatOdds(pick.odds),
-        conf: pick.confidence,
-        free: i === 2,
-        analysis: generateAnalysis(pick)
+      allPicks['ufc'] = top3.map((f,i) => ({
+        badge: badges[i], color: colors[i],
+        game: f.game, name: f.name,
+        odds: formatOdds(f.odds), conf: f.conf,
+        free: i === 2, type: 'ML', analysis: f.analysis
       }));
       continue;
     }
 
-    const games = await fetchOdds(sportKey);
-    if(!games || games.length === 0) {
+    console.log(`Generating picks for ${sport}...`);
+    const picks = await getPicksForSport(sportKey, SPORT_LABELS[sport]);
+    if(picks && picks.length > 0) {
+      allPicks[sport] = picks;
+      console.log(`✓ ${sport} — ${picks.length} picks generated`);
+    } else {
       allPicks[sport] = getDefaultPicksForSport(sport);
-      continue;
+      console.log(`⚠ ${sport} — no qualifying picks found, using defaults`);
     }
-
-    const futureGames = games.filter(game => {
-      const gameTime = new Date(game.commence_time);
-      return gameTime > now && game.bookmakers && game.bookmakers.length >= 2;
-    });
-
-    if(futureGames.length === 0) {
-      allPicks[sport] = getDefaultPicksForSport(sport);
-      continue;
-    }
-
-    const picks = [];
-    futureGames.forEach(game => {
-      const pick = getBestOdds(game);
-      if(pick) picks.push({...pick, sport});
-    });
-
-    if(picks.length === 0) {
-      allPicks[sport] = getDefaultPicksForSport(sport);
-      continue;
-    }
-
-    picks.sort((a,b) => b.confidence - a.confidence);
-    const top3 = picks.slice(0,3);
-    const badges = ['🥇 BEST BET','🥈 STRONG PLAY','🥉 VALUE BET'];
-    const colors = ['#FFD700','#C0C0C0','#CD7F32'];
-    allPicks[sport] = top3.map((pick,i) => ({
-      badge: badges[i],
-      color: colors[i],
-      game: `${SPORT_LABELS[sport]} · ${pick.team} vs ${pick.opponent}`,
-      name: `${pick.team} ML`,
-      odds: formatOdds(pick.odds),
-      conf: pick.confidence,
-      free: i === 2,
-      analysis: generateAnalysis(pick)
-    }));
   }
+
   return allPicks;
 }
 
 function getDefaultPicksForSport(sport) {
   return [
-    {badge:'🥉 VALUE BET',color:'#CD7F32',game:`${SPORT_LABELS[sport]} · No games available`,name:'Check back soon',odds:'-110',conf:55,free:true,analysis:'No games with betting lines available right now. Check back later today.'},
-    {badge:'🥇 BEST BET',color:'#FFD700',game:`${SPORT_LABELS[sport]} · No games available`,name:'Pro Pick',odds:'-150',conf:70,free:false,analysis:''},
-    {badge:'🥈 STRONG PLAY',color:'#C0C0C0',game:`${SPORT_LABELS[sport]} · No games available`,name:'Pro Pick',odds:'+110',conf:60,free:false,analysis:''}
+    {badge:'🥉 VALUE BET',color:'#CD7F32',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Check back at next update',odds:'-110',conf:55,free:true,type:'ML',analysis:'Our model found no picks meeting our confidence and value thresholds today. We only show picks we believe in.'},
+    {badge:'🥇 BEST BET',color:'#FFD700',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Pro Pick',odds:'-150',conf:70,free:false,type:'ML',analysis:''},
+    {badge:'🥈 STRONG PLAY',color:'#C0C0C0',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Pro Pick',odds:'+110',conf:60,free:false,type:'ML',analysis:''}
   ];
 }
 
