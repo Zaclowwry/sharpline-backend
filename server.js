@@ -109,7 +109,6 @@ function getAveragePoint(bookmakers, team, market) {
 function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome) {
   const location = isHome ? 'at home' : 'on the road';
   const formattedOdds = formatOdds(odds);
-
   if(pickType === 'h2h') {
     if(conf >= 75) return `${team} is ${conf}% favored ${location}. One of the strongest moneylines on the board — sharp money is backing this heavily.`;
     if(conf >= 65) return `${team} is ${conf}% favored ${location}. Solid edge with consistent line movement in their favor. Strong play today.`;
@@ -203,8 +202,6 @@ async function getPicksForSport(sportKey, sportLabel) {
     });
   });
 
-  if(allCandidates.length === 0) return null;
-
   allCandidates.sort((a, b) => b.valueScore - a.valueScore);
 
   const seen = new Set();
@@ -217,6 +214,36 @@ async function getPicksForSport(sportKey, sportLabel) {
     }
     if(unique.length >= 3) break;
   }
+
+  if(unique.length < 3) {
+    const existingKeys = new Set(unique.map(p => p.game + p.type));
+    const lowCandidates = [];
+    futureH2h.forEach(game => {
+      [game.home_team, game.away_team].forEach(team => {
+        const odds = getAverageOdds(game.bookmakers, team, 'h2h');
+        if(!odds) return;
+        const conf = Math.round(americanToImpliedProb(odds) * 100);
+        if(conf < 55 || !isGoodValue(odds)) return;
+        const key = `${sportLabel} · ${game.home_team} vs ${game.away_team}h2h`;
+        if(existingKeys.has(key)) return;
+        const isHome = team === game.home_team;
+        const opponent = isHome ? game.away_team : game.home_team;
+        const valueScore = conf - Math.abs(odds) / 10;
+        lowCandidates.push({
+          type: 'h2h', label: 'ML',
+          gameTime: game.commence_time,
+          game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+          name: `${team} ML`, odds, conf, valueScore, isHome, team, opponent,
+          analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome)
+        });
+      });
+    });
+    lowCandidates.sort((a,b) => b.valueScore - a.valueScore);
+    const needed = 3 - unique.length;
+    unique.push(...lowCandidates.slice(0, needed));
+  }
+
+  if(unique.length === 0) return null;
 
   const badges = ['🥇 BEST BET', '🥈 STRONG PLAY', '🥉 VALUE BET'];
   const colors = ['#FFD700', '#C0C0C0', '#CD7F32'];
@@ -247,12 +274,10 @@ async function generatePicks() {
         const daysUntil = (gameTime - now) / 1000 / 60 / 60 / 24;
         return gameTime > now && daysUntil <= 7 && game.bookmakers && game.bookmakers.length >= 2;
       });
-
       if(upcomingFights.length === 0) {
         allPicks['ufc'] = { noEvent: true, nextEvent: NEXT_UFC_EVENT };
         continue;
       }
-
       const fights = [];
       upcomingFights.forEach(game => {
         [game.home_team, game.away_team].forEach(team => {
@@ -270,7 +295,6 @@ async function generatePicks() {
           });
         });
       });
-
       fights.sort((a,b) => b.valueScore - a.valueScore);
       const top3 = fights.slice(0,3);
       const badges = ['🥇 BEST BET','🥈 STRONG PLAY','🥉 VALUE BET'];
