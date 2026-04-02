@@ -115,25 +115,23 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome) {
     if(conf >= 65) return `${team} is ${conf}% favored ${location}. Solid edge with consistent line movement in their favor. Strong play today.`;
     return `${team} at ${formattedOdds} offers real value ${location}. At ${conf}% confidence this is a smart play with good upside.`;
   }
-
   if(pickType === 'spreads') {
     if(conf >= 75) return `${team} covering ${point > 0 ? '+' : ''}${point} is one of the strongest spread plays today. Sharp money is heavily on this line.`;
     if(conf >= 65) return `${team} ${point > 0 ? '+' : ''}${point} is a solid spread play. Line movement supports this pick strongly.`;
     return `${team} ${point > 0 ? '+' : ''}${point} at ${formattedOdds} offers value. Good spot to fade the public here.`;
   }
-
   if(pickType === 'totals') {
     const direction = team === 'Over' ? 'over' : 'under';
     if(conf >= 75) return `The ${direction} ${point} is one of the strongest totals plays today. Pace and matchup data strongly support this.`;
     if(conf >= 65) return `${direction.charAt(0).toUpperCase() + direction.slice(1)} ${point} is a solid play. Both teams' recent scoring trends support this line.`;
     return `${direction.charAt(0).toUpperCase() + direction.slice(1)} ${point} at ${formattedOdds} offers value. Situational spots favor this total.`;
   }
-
   return `Strong play — ${conf}% confidence with good value at ${formattedOdds}.`;
 }
 
 async function getPicksForSport(sportKey, sportLabel) {
   const now = new Date();
+  const fortyEightHours = new Date(now.getTime() + 48 * 60 * 60 * 1000);
   const allCandidates = [];
 
   const [h2hGames, spreadGames, totalGames] = await Promise.all([
@@ -142,9 +140,9 @@ async function getPicksForSport(sportKey, sportLabel) {
     fetchOdds(sportKey, 'totals')
   ]);
 
-  const futureH2h = h2hGames.filter(g => new Date(g.commence_time) > now && g.bookmakers && g.bookmakers.length >= 2);
-  const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && g.bookmakers && g.bookmakers.length >= 2);
-  const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && g.bookmakers && g.bookmakers.length >= 2);
+  const futureH2h = h2hGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
+  const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
+  const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
 
   futureH2h.forEach(game => {
     [game.home_team, game.away_team].forEach(team => {
@@ -156,16 +154,10 @@ async function getPicksForSport(sportKey, sportLabel) {
       const opponent = isHome ? game.away_team : game.home_team;
       const valueScore = conf - Math.abs(odds) / 10;
       allCandidates.push({
-        type: 'h2h',
-        label: 'ML',
+        type: 'h2h', label: 'ML',
+        gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
-        name: `${team} ML`,
-        odds,
-        conf,
-        valueScore,
-        isHome,
-        team,
-        opponent,
+        name: `${team} ML`, odds, conf, valueScore, isHome, team, opponent,
         analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome)
       });
     });
@@ -182,17 +174,11 @@ async function getPicksForSport(sportKey, sportLabel) {
       const opponent = isHome ? game.away_team : game.home_team;
       const valueScore = conf - Math.abs(odds) / 10;
       allCandidates.push({
-        type: 'spreads',
-        label: 'SPREAD',
+        type: 'spreads', label: 'SPREAD',
+        gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${team} ${point > 0 ? '+' : ''}${point}`,
-        odds,
-        conf,
-        valueScore,
-        isHome,
-        team,
-        opponent,
-        point,
+        odds, conf, valueScore, isHome, team, opponent, point,
         analysis: generateAnalysis('spreads', team, opponent, conf, odds, point, isHome)
       });
     });
@@ -207,16 +193,11 @@ async function getPicksForSport(sportKey, sportLabel) {
       if(conf < 60 || !isGoodValue(odds)) return;
       const valueScore = conf - Math.abs(odds) / 10;
       allCandidates.push({
-        type: 'totals',
-        label: 'TOTAL',
+        type: 'totals', label: 'TOTAL',
+        gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${direction} ${point}`,
-        odds,
-        conf,
-        valueScore,
-        team: direction,
-        opponent: '',
-        point,
+        odds, conf, valueScore, team: direction, opponent: '', point,
         analysis: generateAnalysis('totals', direction, '', conf, odds, point, false)
       });
     });
@@ -249,6 +230,7 @@ async function getPicksForSport(sportKey, sportLabel) {
     conf: pick.conf,
     free: i === 2,
     type: pick.label,
+    gameTime: pick.gameTime,
     analysis: pick.analysis
   }));
 }
@@ -282,8 +264,8 @@ async function generatePicks() {
           const opponent = team === game.home_team ? game.away_team : game.home_team;
           fights.push({
             game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`,
-            name: `${team} ML`,
-            odds, conf, valueScore,
+            name: `${team} ML`, odds, conf, valueScore,
+            gameTime: game.commence_time,
             analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, false)
           });
         });
@@ -297,7 +279,9 @@ async function generatePicks() {
         badge: badges[i], color: colors[i],
         game: f.game, name: f.name,
         odds: formatOdds(f.odds), conf: f.conf,
-        free: i === 2, type: 'ML', analysis: f.analysis
+        free: i === 2, type: 'ML',
+        gameTime: f.gameTime,
+        analysis: f.analysis
       }));
       continue;
     }
@@ -312,15 +296,14 @@ async function generatePicks() {
       console.log(`⚠ ${sport} — no qualifying picks found, using defaults`);
     }
   }
-
   return allPicks;
 }
 
 function getDefaultPicksForSport(sport) {
   return [
-    {badge:'🥉 VALUE BET',color:'#CD7F32',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Check back at next update',odds:'-110',conf:55,free:true,type:'ML',analysis:'Our model found no picks meeting our confidence and value thresholds today. We only show picks we believe in.'},
-    {badge:'🥇 BEST BET',color:'#FFD700',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Pro Pick',odds:'-150',conf:70,free:false,type:'ML',analysis:''},
-    {badge:'🥈 STRONG PLAY',color:'#C0C0C0',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Pro Pick',odds:'+110',conf:60,free:false,type:'ML',analysis:''}
+    {badge:'🥉 VALUE BET',color:'#CD7F32',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Check back at next update',odds:'-110',conf:55,free:true,type:'ML',gameTime:null,analysis:'Our model found no picks meeting our confidence and value thresholds. We only show picks we believe in.'},
+    {badge:'🥇 BEST BET',color:'#FFD700',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Pro Pick',odds:'-150',conf:70,free:false,type:'ML',gameTime:null,analysis:''},
+    {badge:'🥈 STRONG PLAY',color:'#C0C0C0',game:`${SPORT_LABELS[sport]} · No qualifying picks today`,name:'Pro Pick',odds:'+110',conf:60,free:false,type:'ML',gameTime:null,analysis:''}
   ];
 }
 
