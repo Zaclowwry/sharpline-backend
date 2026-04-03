@@ -1,6 +1,7 @@
 const express = require('express');
 const cors = require('cors');
 const fetch = require('node-fetch');
+const { createClient } = require('@supabase/supabase-js');
 
 const app = express();
 app.use(cors());
@@ -8,6 +9,10 @@ app.use(express.json());
 
 const PORT = process.env.PORT || 3000;
 const ODDS_API_KEY = '2033e71d5b6784b9352bfa561db1a576';
+const SUPABASE_URL = process.env.SUPABASE_URL || 'https://elwbxwzequrfucujhgsy.supabase.co';
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+
+const supabase = SUPABASE_SECRET_KEY ? createClient(SUPABASE_URL, SUPABASE_SECRET_KEY) : null;
 
 const SPORTS = {
   nba: 'basketball_nba',
@@ -21,6 +26,12 @@ const SPORT_LABELS = {
   mlb: '⚾ MLB',
   nhl: '🏒 NHL',
   ufc: '🥊 UFC'
+};
+
+const SCORES_SPORTS = {
+  nba: 'basketball_nba',
+  mlb: 'baseball_mlb',
+  nhl: 'icehockey_nhl'
 };
 
 const NEXT_UFC_EVENT = {
@@ -54,6 +65,193 @@ app.get('/picks', async (req, res) => {
     res.json({ updatedAt: new Date(), picks: getDefaultPicks() });
   }
 });
+
+app.get('/results', async (req, res) => {
+  try {
+    if(!supabase) return res.json({ error: 'Database not configured' });
+    const thirtyDaysAgo = new Date();
+    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+    const { data, error } = await supabase
+      .from('picks_history')
+      .select('*')
+      .gte('created_at', thirtyDaysAgo.toISOString())
+      .order('created_at', { ascending: false });
+    if(error) throw error;
+    const allTime = await supabase
+      .from('picks_history')
+      .select('result, sport')
+      .neq('result', 'pending');
+    const stats = calculateStats(allTime.data || []);
+    const monthly = groupByMonth(data || []);
+    res.json({ stats, monthly, recent: data || [] });
+  } catch(e) {
+    console.log('Results error:', e.message);
+    res.json({ stats: {}, monthly: {}, recent: [] });
+  }
+});
+
+function calculateStats(picks) {
+  const total = picks.filter(p => p.result !== 'pending');
+  const wins = total.filter(p => p.result === 'win');
+  const losses = total.filter(p => p.result === 'loss');
+  const pushes = total.filter(p => p.result === 'push');
+  const byPport = {};
+  ['nba','mlb','nhl','ufc'].forEach(sport => {
+    const sportPicks = total.filter(p => p.sport === sport);
+    const sportWins = sportPicks.filter(p => p.result === 'win');
+    byPport[sport] = {
+      wins: sportWins.length,
+      total: sportPicks.length,
+      rate: sportPicks.length > 0 ? Math.round((sportWins.length / sportPicks.length) * 100) : 0
+    };
+  });
+  return {
+    wins: wins.length,
+    losses: losses.length,
+    pushes: pushes.length,
+    total: total.length,
+    winRate: total.length > 0 ? Math.round((wins.length / total.length) * 100) : 0,
+    bySport: byPport
+  };
+}
+
+function groupByMonth(picks) {
+  const months = {};
+  picks.forEach(pick => {
+    const date = new Date(pick.created_at);
+    const key = `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`;
+    const label = date.toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+    if(!months[key]) months[key] = { label, picks: [] };
+    months[key].picks.push(pick);
+  });
+  return months;
+}
+
+async function savePicks(sport, picks) {
+  if(!supabase || !picks || picks.length === 0) return;
+  try {
+    const rows = picks.map(pick => ({
+      sport,
+      game: pick.game,
+      pick_name: pick.name,
+      odds: pick.odds,
+      confidence: pick.conf,
+      bet_type: pick.type || 'ML',
+      game_time: pick.gameTime,
+      result: 'pending',
+      is_free: pick.free,
+      commence_time: pick.gameTime
+    }));
+    const today = new Date().toISOString().split('T')[0];
+    for(const row of rows) {
+      const { data: existing } = await supabase
+        .from('picks_history')
+        .select('id')
+        .eq('sport', row.sport)
+        .eq('pick_name', row.pick_name)
+        .gte('created_at', `${today}T00:00:00.000Z`)
+        .limit(1);
+      if(!existing || existing.length === 0) {
+        await supabase.from('picks_history').insert(row);
+      }
+    }
+    console.log(`✓ Saved ${rows.length} picks for ${sport} to database`);
+  } catch(e) {
+    console.log('Error saving picks:', e.message);
+  }
+}
+
+async function checkAndUpdateResults() {
+  if(!supabase) return;
+  console.log('Checking results...');
+  try {
+    const { data: pendingPicks } = await supabase
+      .from('picks_history')
+      .select('*')
+      .eq('result', 'pending')
+      .lt('commence_time', new Date().toISOString());
+    if(!pendingPicks || pendingPicks.length === 0) {
+      console.log('No pending picks to check');
+      return;
+    }
+    console.log(`Checking ${pendingPicks.length} pending picks...`);
+    for(const [sport, sportKey] of Object.entries(SCORES_SPORTS)) {
+      const sportPending = pendingPicks.filter(p => p.sport === sport);
+      if(sportPending.length === 0) continue;
+      try {
+        const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/scores/?apiKey=${ODDS_API_KEY}&daysFrom=3`;
+        const res = await fetch(url);
+        const scores = await res.json();
+        if(!Array.isArray(scores)) continue;
+        for(const pick of sportPending) {
+          const gameResult = findGameResult(scores, pick);
+          if(gameResult) {
+            const result = determineResult(pick, gameResult);
+            if(result) {
+              await supabase
+                .from('picks_history')
+                .update({ result })
+                .eq('id', pick.id);
+              console.log(`✓ Updated ${pick.pick_name} — ${result}`);
+            }
+          }
+        }
+      } catch(e) {
+        console.log(`Error checking ${sport} results:`, e.message);
+      }
+    }
+    console.log('✅ Results check complete');
+  } catch(e) {
+    console.log('Error in checkAndUpdateResults:', e.message);
+  }
+}
+
+function findGameResult(scores, pick) {
+  return scores.find(score => {
+    if(!score.completed) return false;
+    const homeMatch = score.home_team && pick.game && pick.game.includes(score.home_team);
+    const awayMatch = score.away_team && pick.game && pick.game.includes(score.away_team);
+    return homeMatch && awayMatch;
+  });
+}
+
+function determineResult(pick, gameResult) {
+  try {
+    if(!gameResult.scores || gameResult.scores.length < 2) return null;
+    const homeScore = parseInt(gameResult.scores.find(s => s.name === gameResult.home_team)?.score || 0);
+    const awayScore = parseInt(gameResult.scores.find(s => s.name === gameResult.away_team)?.score || 0);
+    const pickName = pick.pick_name.toLowerCase();
+    const betType = pick.bet_type;
+    if(betType === 'ML') {
+      const winner = homeScore > awayScore ? gameResult.home_team : gameResult.away_team;
+      if(homeScore === awayScore) return 'push';
+      return pickName.includes(winner.toLowerCase()) ? 'win' : 'loss';
+    }
+    if(betType === 'SPREAD') {
+      const spreadMatch = pick.pick_name.match(/([+-]\d+\.?\d*)/);
+      if(!spreadMatch) return null;
+      const spread = parseFloat(spreadMatch[1]);
+      const isHome = pickName.includes(gameResult.home_team.toLowerCase());
+      const teamScore = isHome ? homeScore : awayScore;
+      const oppScore = isHome ? awayScore : homeScore;
+      const adjustedScore = teamScore + spread;
+      if(adjustedScore === oppScore) return 'push';
+      return adjustedScore > oppScore ? 'win' : 'loss';
+    }
+    if(betType === 'TOTAL') {
+      const totalMatch = pick.pick_name.match(/(\d+\.?\d*)/);
+      if(!totalMatch) return null;
+      const total = parseFloat(totalMatch[1]);
+      const combined = homeScore + awayScore;
+      if(combined === total) return 'push';
+      if(pickName.includes('over')) return combined > total ? 'win' : 'loss';
+      if(pickName.includes('under')) return combined < total ? 'win' : 'loss';
+    }
+    return null;
+  } catch(e) {
+    return null;
+  }
+}
 
 async function fetchOdds(sportKey, markets) {
   try {
@@ -132,17 +330,14 @@ async function getPicksForSport(sportKey, sportLabel) {
   const now = new Date();
   const fortyEightHours = new Date(now.getTime() + 48 * 60 * 60 * 1000);
   const allCandidates = [];
-
   const [h2hGames, spreadGames, totalGames] = await Promise.all([
     fetchOdds(sportKey, 'h2h'),
     fetchOdds(sportKey, 'spreads'),
     fetchOdds(sportKey, 'totals')
   ]);
-
   const futureH2h = h2hGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
   const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
   const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
-
   futureH2h.forEach(game => {
     [game.home_team, game.away_team].forEach(team => {
       const odds = getAverageOdds(game.bookmakers, team, 'h2h');
@@ -153,15 +348,13 @@ async function getPicksForSport(sportKey, sportLabel) {
       const opponent = isHome ? game.away_team : game.home_team;
       const valueScore = conf - Math.abs(odds) / 10;
       allCandidates.push({
-        type: 'h2h', label: 'ML',
-        gameTime: game.commence_time,
+        type: 'h2h', label: 'ML', gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${team} ML`, odds, conf, valueScore, isHome, team, opponent,
         analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome)
       });
     });
   });
-
   futureSpread.forEach(game => {
     [game.home_team, game.away_team].forEach(team => {
       const odds = getAverageOdds(game.bookmakers, team, 'spreads');
@@ -173,8 +366,7 @@ async function getPicksForSport(sportKey, sportLabel) {
       const opponent = isHome ? game.away_team : game.home_team;
       const valueScore = conf - Math.abs(odds) / 10;
       allCandidates.push({
-        type: 'spreads', label: 'SPREAD',
-        gameTime: game.commence_time,
+        type: 'spreads', label: 'SPREAD', gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${team} ${point > 0 ? '+' : ''}${point}`,
         odds, conf, valueScore, isHome, team, opponent, point,
@@ -182,7 +374,6 @@ async function getPicksForSport(sportKey, sportLabel) {
       });
     });
   });
-
   futureTotals.forEach(game => {
     ['Over', 'Under'].forEach(direction => {
       const odds = getAverageOdds(game.bookmakers, direction, 'totals');
@@ -192,8 +383,7 @@ async function getPicksForSport(sportKey, sportLabel) {
       if(conf < 60 || !isGoodValue(odds)) return;
       const valueScore = conf - Math.abs(odds) / 10;
       allCandidates.push({
-        type: 'totals', label: 'TOTAL',
-        gameTime: game.commence_time,
+        type: 'totals', label: 'TOTAL', gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${direction} ${point}`,
         odds, conf, valueScore, team: direction, opponent: '', point,
@@ -201,20 +391,14 @@ async function getPicksForSport(sportKey, sportLabel) {
       });
     });
   });
-
   allCandidates.sort((a, b) => b.valueScore - a.valueScore);
-
   const seen = new Set();
   const unique = [];
   for(const pick of allCandidates) {
     const key = pick.game + pick.type;
-    if(!seen.has(key)) {
-      seen.add(key);
-      unique.push(pick);
-    }
+    if(!seen.has(key)) { seen.add(key); unique.push(pick); }
     if(unique.length >= 3) break;
   }
-
   if(unique.length < 3) {
     const existingKeys = new Set(unique.map(p => p.game + p.type));
     const lowCandidates = [];
@@ -230,8 +414,7 @@ async function getPicksForSport(sportKey, sportLabel) {
         const opponent = isHome ? game.away_team : game.home_team;
         const valueScore = conf - Math.abs(odds) / 10;
         lowCandidates.push({
-          type: 'h2h', label: 'ML',
-          gameTime: game.commence_time,
+          type: 'h2h', label: 'ML', gameTime: game.commence_time,
           game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
           name: `${team} ML`, odds, conf, valueScore, isHome, team, opponent,
           analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome)
@@ -239,33 +422,21 @@ async function getPicksForSport(sportKey, sportLabel) {
       });
     });
     lowCandidates.sort((a,b) => b.valueScore - a.valueScore);
-    const needed = 3 - unique.length;
-    unique.push(...lowCandidates.slice(0, needed));
+    unique.push(...lowCandidates.slice(0, 3 - unique.length));
   }
-
   if(unique.length === 0) return null;
-
   const badges = ['🥇 BEST BET', '🥈 STRONG PLAY', '🥉 VALUE BET'];
   const colors = ['#FFD700', '#C0C0C0', '#CD7F32'];
-
   return unique.map((pick, i) => ({
-    badge: badges[i],
-    color: colors[i],
-    game: pick.game,
-    name: pick.name,
-    odds: formatOdds(pick.odds),
-    conf: pick.conf,
-    free: i === 2,
-    type: pick.label,
-    gameTime: pick.gameTime,
-    analysis: pick.analysis
+    badge: badges[i], color: colors[i], game: pick.game, name: pick.name,
+    odds: formatOdds(pick.odds), conf: pick.conf, free: i === 2,
+    type: pick.label, gameTime: pick.gameTime, analysis: pick.analysis
   }));
 }
 
 async function generatePicks() {
   const allPicks = {};
   const now = new Date();
-
   for(const [sport, sportKey] of Object.entries(SPORTS)) {
     if(sport === 'ufc') {
       const games = await fetchOdds(sportKey, 'h2h');
@@ -299,25 +470,24 @@ async function generatePicks() {
       const top3 = fights.slice(0,3);
       const badges = ['🥇 BEST BET','🥈 STRONG PLAY','🥉 VALUE BET'];
       const colors = ['#FFD700','#C0C0C0','#CD7F32'];
-      allPicks['ufc'] = top3.map((f,i) => ({
-        badge: badges[i], color: colors[i],
-        game: f.game, name: f.name,
-        odds: formatOdds(f.odds), conf: f.conf,
-        free: i === 2, type: 'ML',
-        gameTime: f.gameTime,
-        analysis: f.analysis
+      const ufcPicks = top3.map((f,i) => ({
+        badge: badges[i], color: colors[i], game: f.game, name: f.name,
+        odds: formatOdds(f.odds), conf: f.conf, free: i === 2, type: 'ML',
+        gameTime: f.gameTime, analysis: f.analysis
       }));
+      allPicks['ufc'] = ufcPicks;
+      await savePicks('ufc', ufcPicks);
       continue;
     }
-
     console.log(`Generating picks for ${sport}...`);
     const picks = await getPicksForSport(sportKey, SPORT_LABELS[sport]);
     if(picks && picks.length > 0) {
       allPicks[sport] = picks;
-      console.log(`✓ ${sport} — ${picks.length} picks generated`);
+      await savePicks(sport, picks);
+      console.log(`✓ ${sport} — ${picks.length} picks generated and saved`);
     } else {
       allPicks[sport] = getDefaultPicksForSport(sport);
-      console.log(`⚠ ${sport} — no qualifying picks found, using defaults`);
+      console.log(`⚠ ${sport} — no qualifying picks found`);
     }
   }
   return allPicks;
