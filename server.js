@@ -257,11 +257,13 @@ async function savePicks(sport, picks) {
   try {
     const today = new Date().toISOString().split('T')[0];
     for(const pick of picks) {
+      if(!pick.name || pick.name === 'Pro Pick' || pick.name === 'Check back at next update') continue;
       const { data: existing } = await supabase
         .from('picks_history')
         .select('id')
         .eq('sport', sport)
         .eq('pick_name', pick.name)
+        .eq('game', pick.game)
         .gte('created_at', `${today}T00:00:00.000Z`)
         .limit(1);
       if(!existing || existing.length === 0) {
@@ -271,14 +273,15 @@ async function savePicks(sport, picks) {
           bet_type: pick.type || 'ML', game_time: pick.gameTime,
           result: 'pending', is_free: pick.free, commence_time: pick.gameTime
         });
+        console.log(`✓ Saved new pick: ${pick.name}`);
+      } else {
+        console.log(`⟳ Skipped duplicate: ${pick.name}`);
       }
     }
-    console.log(`✓ Saved picks for ${sport}`);
   } catch(e) {
     console.log('Error saving picks:', e.message);
   }
 }
-
 async function fetchOdds(sportKey, markets) {
   try {
     const url = `https://api.the-odds-api.com/v4/sports/${sportKey}/odds/?apiKey=${ODDS_API_KEY}&regions=us&markets=${markets}&oddsFormat=american`;
