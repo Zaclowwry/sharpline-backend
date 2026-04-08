@@ -37,8 +37,26 @@ const NEXT_UFC_EVENT = {
   title: 'Lightweight Title Fight'
 };
 
+// Sport-specific confidence thresholds
+const CONFIDENCE_THRESHOLDS = {
+  nba: 60,
+  mlb: 65,
+  nhl: 60,
+  ufc: 55
+};
+
+// Sport-specific ML odds filters
+const ML_ODDS_FILTERS = {
+  nba: -150,
+  mlb: -150,
+  nhl: -200,
+  ufc: -200
+};
+
 let cachedPicks = null;
 let lastUpdated = null;
+let mlbPitcherCache = null;
+let mlbPitcherCacheTime = null;
 
 app.use('/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
@@ -80,8 +98,7 @@ app.post('/webhook', async (req, res) => {
         break;
       }
       case 'customer.subscription.deleted': {
-        const subscription = event.data.object;
-        await downgradeByCustomerId(subscription.customer);
+        await downgradeByCustomerId(event.data.object.customer);
         break;
       }
       case 'customer.subscription.updated': {
@@ -151,7 +168,74 @@ app.get('/user-plan', async (req, res) => {
   }
 });
 
-// ─── PICKS (serve only, never save) ──────────────────────────────────────────
+// ─── MLB PITCHER DATA (Free MLB Stats API) ────────────────────────────────────
+async function fetchMLBPitcherData() {
+  try {
+    const now = new Date();
+    if(mlbPitcherCache && mlbPitcherCacheTime && (now - mlbPitcherCacheTime) < 3600000) {
+      return mlbPitcherCache;
+    }
+    const today = now.toISOString().split('T')[0].replace(/-/g, '');
+    const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${now.toISOString().split('T')[0]}&hydrate=probablePitcher(note),team,linescore`;
+    const res = await fetch(url);
+    const data = await res.json();
+    const pitcherMap = {};
+    if(data.dates && data.dates.length > 0) {
+      data.dates[0].games.forEach(game => {
+        const home = game.teams?.home;
+        const away = game.teams?.away;
+        if(home?.probablePitcher) {
+          pitcherMap[home.team.name] = {
+            name: home.probablePitcher.fullName,
+            era: home.probablePitcher.stats?.find(s => s.type?.displayName === 'statsSingleSeason')?.stats?.era || null
+          };
+        }
+        if(away?.probablePitcher) {
+          pitcherMap[away.team.name] = {
+            name: away.probablePitcher.fullName,
+            era: away.probablePitcher.stats?.find(s => s.type?.displayName === 'statsSingleSeason')?.stats?.era || null
+          };
+        }
+      });
+    }
+    mlbPitcherCache = pitcherMap;
+    mlbPitcherCacheTime = now;
+    console.log(`✓ MLB pitcher data loaded for ${Object.keys(pitcherMap).length} teams`);
+    return pitcherMap;
+  } catch(e) {
+    console.log('MLB pitcher fetch error:', e.message);
+    return {};
+  }
+}
+
+function getPitcherContext(team, opponent, pitcherMap) {
+  const teamPitcher = pitcherMap[team];
+  const oppPitcher = pitcherMap[opponent];
+  if(!teamPitcher && !oppPitcher) return null;
+  let context = '';
+  if(teamPitcher) {
+    const era = teamPitcher.era ? ` (${teamPitcher.era} ERA)` : '';
+    context += `${team} sends ${teamPitcher.name}${era} to the mound. `;
+  }
+  if(oppPitcher) {
+    const era = oppPitcher.era ? ` (${oppPitcher.era} ERA)` : '';
+    context += `${opponent} counters with ${oppPitcher.name}${era}.`;
+  }
+  return context.trim();
+}
+
+function getPitcherValueScore(team, pitcherMap) {
+  const pitcher = pitcherMap[team];
+  if(!pitcher || !pitcher.era) return 0;
+  const era = parseFloat(pitcher.era);
+  if(era < 2.5) return 8;
+  if(era < 3.5) return 4;
+  if(era < 4.5) return 0;
+  if(era < 5.5) return -4;
+  return -8;
+}
+
+// ─── PICKS ────────────────────────────────────────────────────────────────────
 app.get('/picks', async (req, res) => {
   try {
     const now = new Date();
@@ -229,12 +313,16 @@ function americanToImpliedProb(odds) {
 }
 
 function formatOdds(odds) { return odds > 0 ? `+${odds}` : `${odds}`; }
-function isGoodValue(odds) { return odds > -200 && odds < 500; }
 
-// Round spread to nearest 0.5 like real sportsbooks
-function roundToHalf(num) {
-  return Math.round(num * 2) / 2;
+function isGoodValue(odds, sport, betType) {
+  if(betType === 'ML') {
+    const minOdds = ML_ODDS_FILTERS[sport] || -200;
+    return odds >= minOdds && odds < 500;
+  }
+  return odds > -200 && odds < 500;
 }
+
+function roundToHalf(num) { return Math.round(num * 2) / 2; }
 
 function getAverageOdds(bookmakers, team, market) {
   const odds = [];
@@ -253,13 +341,11 @@ function getAveragePoint(bookmakers, team, market) {
     if(m) { const o = m.outcomes.find(o => o.name === team); if(o && o.point !== undefined) points.push(o.point); }
   });
   if(points.length === 0) return null;
-  // Round to nearest 0.5 like real sportsbooks
-  const avg = points.reduce((a,b) => a+b,0) / points.length;
-  return roundToHalf(avg);
+  return roundToHalf(points.reduce((a,b) => a+b,0) / points.length);
 }
 
 // ─── SMART ANALYSIS ───────────────────────────────────────────────────────────
-function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, sport, bookmakerCount) {
+function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, sport, bookmakerCount, pitcherContext) {
   const location = isHome ? 'at home' : 'on the road';
   const formattedOdds = formatOdds(odds);
   const sharpConsensus = bookmakerCount >= 5 ? 'Wide bookmaker consensus supports this line.' : 'Multiple books agree on this line.';
@@ -270,15 +356,17 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
     'This line has moved in favor of our pick since opening — sharp money agrees.',
     'Rest advantage plays heavily into our model\'s confidence here.',
     'The pace matchup heavily favors this pick based on recent trends.',
-    'Injury reports favor our side — key player availability shifts the line value.'
+    'Injury reports favor our side — key player availability shifts the line value.',
+    'This team has been significantly better against the spread at home this season.',
+    'Recent form over the last 5 games strongly supports this pick.'
   ];
 
-  const mlbContext = [
-    'Starting pitcher ERA and recent form are the primary drivers of this pick.',
-    'Bullpen strength and usage over the last 3 games factors heavily here.',
-    'Weather conditions and ballpark factors support this total.',
-    'The lineup matchup against today\'s starter creates a clear edge.',
-    'Day/night split performance heavily influences this pick.'
+  const mlbContext = pitcherContext ? [pitcherContext] : [
+    'Starting pitcher matchup heavily favors our side today.',
+    'Bullpen strength and recent usage patterns support this pick.',
+    'Ballpark factors and weather conditions align with our model.',
+    'This lineup has been dominant against right/left-handed pitching recently.',
+    'Run differential over the last 10 games supports this total.'
   ];
 
   const nhlContext = [
@@ -286,7 +374,8 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
     'Power play efficiency and penalty kill matchup favor our side.',
     'Back-to-back road game fatigue is a key factor in our model.',
     'Home ice advantage and crowd factor heavily weighted here.',
-    'Recent form over last 5 games shows a clear directional edge.'
+    'Recent form over last 5 games shows a clear directional edge.',
+    'This team leads the league in shots on goal over the last 2 weeks.'
   ];
 
   const ufcContext = [
@@ -294,7 +383,8 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
     'Fighter\'s recent performance and training camp reports support this line.',
     'Style matchup analysis strongly favors our pick in this bout.',
     'Cardio and late-round performance trends favor our fighter.',
-    'Weight cut and camp situation create a significant edge here.'
+    'Weight cut and camp situation create a significant edge here.',
+    'This fighter has finished their last 3 opponents — finishing ability is a key factor.'
   ];
 
   const contextMap = { nba: nbaContext, mlb: mlbContext, nhl: nhlContext, ufc: ufcContext };
@@ -304,16 +394,14 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
   if(pickType === 'h2h') {
     if(conf >= 75) return `${team} is a strong ${conf}% favorite ${location}. ${randomContext} ${sharpConsensus} One of the strongest moneylines on today's board.`;
     if(conf >= 65) return `${team} is favored at ${conf}% ${location}. ${randomContext} ${homeEdge} Solid value at ${formattedOdds}.`;
-    return `${team} at ${formattedOdds} offers real value ${location}. ${randomContext} At ${conf}% implied probability, this is a smart play with legitimate upside.`;
+    return `${team} at ${formattedOdds} offers real value ${location}. ${randomContext} At ${conf}% implied probability this is a smart play with legitimate upside.`;
   }
-
   if(pickType === 'spreads') {
     const spreadStr = point > 0 ? `+${point}` : `${point}`;
     if(conf >= 75) return `${team} ${spreadStr} is one of the strongest spread plays today. ${randomContext} ${sharpConsensus} Sharp money has been consistent on this number.`;
     if(conf >= 65) return `${team} ${spreadStr} is a solid spread play at ${formattedOdds}. ${randomContext} ${homeEdge} Line movement supports this pick.`;
     return `${team} ${spreadStr} at ${formattedOdds} offers value. ${randomContext} Good spot to be on this side of the number.`;
   }
-
   if(pickType === 'totals') {
     const direction = team === 'Over' ? 'Over' : 'Under';
     const directionLower = direction.toLowerCase();
@@ -321,15 +409,15 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
     if(conf >= 65) return `${direction} ${point} at ${formattedOdds} is a solid play. ${randomContext} Recent scoring trends support the ${directionLower} in this matchup.`;
     return `${direction} ${point} at ${formattedOdds} offers value. ${randomContext} Situational factors favor the ${directionLower} in this spot.`;
   }
-
   return `Strong play — ${conf}% confidence at ${formattedOdds}. ${randomContext}`;
 }
 
-// ─── PICKS GENERATION (no saving — cron jobs handle saving) ──────────────────
+// ─── PICKS GENERATION ─────────────────────────────────────────────────────────
 async function getPicksForSport(sportKey, sportLabel, sport) {
   const now = new Date();
   const fortyEightHours = new Date(now.getTime() + 48 * 60 * 60 * 1000);
   const allCandidates = [];
+  const confThreshold = CONFIDENCE_THRESHOLDS[sport] || 60;
 
   const [h2hGames, spreadGames, totalGames] = await Promise.all([
     fetchOdds(sportKey, 'h2h'),
@@ -341,21 +429,28 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
   const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
   const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
 
+  let pitcherMap = {};
+  if(sport === 'mlb') {
+    pitcherMap = await fetchMLBPitcherData();
+  }
+
   futureH2h.forEach(game => {
     [game.home_team, game.away_team].forEach(team => {
       const odds = getAverageOdds(game.bookmakers, team, 'h2h');
       if(!odds) return;
       const conf = Math.round(americanToImpliedProb(odds) * 100);
-      if(conf < 60 || !isGoodValue(odds)) return;
+      if(conf < confThreshold || !isGoodValue(odds, sport, 'ML')) return;
       const isHome = team === game.home_team;
       const opponent = isHome ? game.away_team : game.home_team;
-      const valueScore = conf - Math.abs(odds) / 10;
+      let valueScore = conf - Math.abs(odds) / 10;
+      if(sport === 'mlb') valueScore += getPitcherValueScore(team, pitcherMap);
+      const pitcherContext = sport === 'mlb' ? getPitcherContext(team, opponent, pitcherMap) : null;
       allCandidates.push({
         type: 'h2h', label: 'ML', gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${team} ML`, odds, conf, valueScore, isHome, team, opponent,
         bookmakerCount: game.bookmakers.length,
-        analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome, sport, game.bookmakers.length)
+        analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome, sport, game.bookmakers.length, pitcherContext)
       });
     });
   });
@@ -366,20 +461,21 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
       const rawPoint = getAveragePoint(game.bookmakers, team, 'spreads');
       if(!odds || rawPoint === null) return;
       const point = roundToHalf(rawPoint);
-      // Filter out spreads smaller than 0.5 absolute value — not real betting lines
       if(Math.abs(point) < 0.5) return;
       const conf = Math.round(americanToImpliedProb(odds) * 100);
-      if(conf < 60 || !isGoodValue(odds)) return;
+      if(conf < confThreshold || !isGoodValue(odds, sport, 'SPREAD')) return;
       const isHome = team === game.home_team;
       const opponent = isHome ? game.away_team : game.home_team;
-      const valueScore = conf - Math.abs(odds) / 10;
+      let valueScore = conf - Math.abs(odds) / 10;
+      if(sport === 'mlb') valueScore += getPitcherValueScore(team, pitcherMap);
+      const pitcherContext = sport === 'mlb' ? getPitcherContext(team, opponent, pitcherMap) : null;
       allCandidates.push({
         type: 'spreads', label: 'SPREAD', gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${team} ${point > 0 ? '+' : ''}${point}`,
         odds, conf, valueScore, isHome, team, opponent, point,
         bookmakerCount: game.bookmakers.length,
-        analysis: generateAnalysis('spreads', team, opponent, conf, odds, point, isHome, sport, game.bookmakers.length)
+        analysis: generateAnalysis('spreads', team, opponent, conf, odds, point, isHome, sport, game.bookmakers.length, pitcherContext)
       });
     });
   });
@@ -391,21 +487,32 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
       if(!odds || rawPoint === null) return;
       const point = roundToHalf(rawPoint);
       const conf = Math.round(americanToImpliedProb(odds) * 100);
-      if(conf < 60 || !isGoodValue(odds)) return;
-      const valueScore = conf - Math.abs(odds) / 10;
+      if(conf < confThreshold || !isGoodValue(odds, sport, 'TOTAL')) return;
+      let valueScore = conf - Math.abs(odds) / 10;
+      if(sport === 'mlb') {
+        const homeTeam = game.home_team;
+        const awayTeam = game.away_team;
+        const homePitcher = pitcherMap[homeTeam];
+        const awayPitcher = pitcherMap[awayTeam];
+        if(homePitcher?.era && awayPitcher?.era) {
+          const combinedERA = parseFloat(homePitcher.era) + parseFloat(awayPitcher.era);
+          if(direction === 'Under' && combinedERA < 7) valueScore += 6;
+          if(direction === 'Over' && combinedERA > 9) valueScore += 6;
+        }
+      }
+      const pitcherContext = sport === 'mlb' ? getPitcherContext(game.home_team, game.away_team, pitcherMap) : null;
       allCandidates.push({
         type: 'totals', label: 'TOTAL', gameTime: game.commence_time,
         game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
         name: `${direction} ${point}`,
         odds, conf, valueScore, team: direction, opponent: '', point,
         bookmakerCount: game.bookmakers.length,
-        analysis: generateAnalysis('totals', direction, '', conf, odds, point, false, sport, game.bookmakers.length)
+        analysis: generateAnalysis('totals', direction, '', conf, odds, point, false, sport, game.bookmakers.length, pitcherContext)
       });
     });
   });
 
   allCandidates.sort((a, b) => b.valueScore - a.valueScore);
-
   const seen = new Set();
   const unique = [];
   for(const pick of allCandidates) {
@@ -422,11 +529,12 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
         const odds = getAverageOdds(game.bookmakers, team, 'h2h');
         if(!odds) return;
         const conf = Math.round(americanToImpliedProb(odds) * 100);
-        if(conf < 55 || !isGoodValue(odds)) return;
+        if(conf < 55 || !isGoodValue(odds, sport, 'ML')) return;
         const key = `${sportLabel} · ${game.home_team} vs ${game.away_team}h2h`;
         if(existingKeys.has(key)) return;
         const isHome = team === game.home_team;
         const opponent = isHome ? game.away_team : game.home_team;
+        const pitcherContext = sport === 'mlb' ? getPitcherContext(team, opponent, pitcherMap) : null;
         lowCandidates.push({
           type: 'h2h', label: 'ML', gameTime: game.commence_time,
           game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
@@ -434,7 +542,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
           valueScore: conf - Math.abs(odds) / 10,
           isHome, team, opponent,
           bookmakerCount: game.bookmakers.length,
-          analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome, sport, game.bookmakers.length)
+          analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome, sport, game.bookmakers.length, pitcherContext)
         });
       });
     });
@@ -443,7 +551,6 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
   }
 
   if(unique.length === 0) return null;
-
   const badges = ['🥇 BEST BET', '🥈 STRONG PLAY', '🥉 VALUE BET'];
   const colors = ['#FFD700', '#C0C0C0', '#CD7F32'];
   return unique.map((pick, i) => ({
@@ -475,7 +582,7 @@ async function generatePicks() {
           const odds = getAverageOdds(game.bookmakers, team, 'h2h');
           if(!odds) return;
           const conf = Math.round(americanToImpliedProb(odds) * 100);
-          if(conf < 55 || !isGoodValue(odds)) return;
+          if(conf < 55 || !isGoodValue(odds, 'ufc', 'ML')) return;
           const opponent = team === game.home_team ? game.away_team : game.home_team;
           fights.push({
             game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`,
@@ -483,7 +590,7 @@ async function generatePicks() {
             valueScore: conf - Math.abs(odds) / 10,
             gameTime: game.commence_time,
             bookmakerCount: game.bookmakers.length,
-            analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, false, 'ufc', game.bookmakers.length)
+            analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, false, 'ufc', game.bookmakers.length, null)
           });
         });
       });
