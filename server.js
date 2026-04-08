@@ -30,11 +30,11 @@ const SPORT_LABELS = {
 };
 
 const NEXT_UFC_EVENT = {
-  name: 'UFC 314',
+  name: 'UFC 327',
   date: 'Saturday, April 12, 2026',
-  mainEvent: 'Charles Oliveira vs Arman Tsarukyan',
-  coMain: 'Paige VanZant vs Kayla Harrison',
-  title: 'Lightweight Title Fight'
+  mainEvent: 'Jiri Prochazka vs Carlos Ulberg',
+  coMain: 'Curtis Blaydes vs Josh Hokit',
+  title: 'Light Heavyweight Title Fight'
 };
 
 // Sport-specific confidence thresholds
