@@ -312,7 +312,15 @@ function americanToImpliedProb(odds) {
   return Math.abs(odds) / (Math.abs(odds) + 100);
 }
 
-function formatOdds(odds) { return odds > 0 ? `+${odds}` : `${odds}`; }
+function roundToStandardOdds(odds) {
+  // Round to nearest 5 like real sportsbooks
+  return Math.round(odds / 5) * 5;
+}
+
+function formatOdds(odds) {
+  const rounded = roundToStandardOdds(odds);
+  return rounded > 0 ? `+${rounded}` : `${rounded}`;
+}
 
 function isGoodValue(odds, sport, betType) {
   if(betType === 'ML') {
