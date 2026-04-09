@@ -30,14 +30,13 @@ const SPORT_LABELS = {
 };
 
 const NEXT_UFC_EVENT = {
-  name: 'UFC 327',
+  name: 'UFC 314',
   date: 'Saturday, April 12, 2026',
   mainEvent: 'Jiri Prochazka vs Carlos Ulberg',
   coMain: 'Curtis Blaydes vs Josh Hokit',
   title: 'Light Heavyweight Title Fight'
 };
 
-// Sport-specific confidence thresholds
 const CONFIDENCE_THRESHOLDS = {
   nba: 60,
   mlb: 65,
@@ -45,7 +44,6 @@ const CONFIDENCE_THRESHOLDS = {
   ufc: 55
 };
 
-// Sport-specific ML odds filters
 const ML_ODDS_FILTERS = {
   nba: -150,
   mlb: -150,
@@ -63,6 +61,29 @@ app.use(express.json());
 
 app.get('/', (req, res) => {
   res.json({ status: 'SharpLine backend running' });
+});
+
+// ─── MANUAL TRIGGER ───────────────────────────────────────────────────────────
+// Hit GET /trigger-picks to force a fresh pick generation and save to Supabase
+app.get('/trigger-picks', async (req, res) => {
+  try {
+    console.log('Manual pick trigger fired...');
+    // Clear cache so /picks also returns fresh data
+    cachedPicks = null;
+    lastUpdated = null;
+
+    const picks = await generatePicks();
+    cachedPicks = picks;
+    lastUpdated = new Date();
+
+    // Also save to picks_history (same as cron job)
+    await saveAllPicks(picks);
+
+    res.json({ success: true, updatedAt: lastUpdated, picks });
+  } catch(e) {
+    console.log('Trigger error:', e.message);
+    res.status(500).json({ success: false, error: e.message });
+  }
 });
 
 // ─── STRIPE WEBHOOK ───────────────────────────────────────────────────────────
@@ -168,14 +189,13 @@ app.get('/user-plan', async (req, res) => {
   }
 });
 
-// ─── MLB PITCHER DATA (Free MLB Stats API) ────────────────────────────────────
+// ─── MLB PITCHER DATA ─────────────────────────────────────────────────────────
 async function fetchMLBPitcherData() {
   try {
     const now = new Date();
     if(mlbPitcherCache && mlbPitcherCacheTime && (now - mlbPitcherCacheTime) < 3600000) {
       return mlbPitcherCache;
     }
-    const today = now.toISOString().split('T')[0].replace(/-/g, '');
     const url = `https://statsapi.mlb.com/api/v1/schedule?sportId=1&date=${now.toISOString().split('T')[0]}&hydrate=probablePitcher(note),team,linescore`;
     const res = await fetch(url);
     const data = await res.json();
@@ -235,7 +255,7 @@ function getPitcherValueScore(team, pitcherMap) {
   return -8;
 }
 
-// ─── PICKS ────────────────────────────────────────────────────────────────────
+// ─── PICKS ENDPOINT ───────────────────────────────────────────────────────────
 app.get('/picks', async (req, res) => {
   try {
     const now = new Date();
@@ -313,7 +333,6 @@ function americanToImpliedProb(odds) {
 }
 
 function roundToStandardOdds(odds) {
-  // Round to nearest 5 like real sportsbooks
   return Math.round(odds / 5) * 5;
 }
 
@@ -322,12 +341,17 @@ function formatOdds(odds) {
   return rounded > 0 ? `+${rounded}` : `${rounded}`;
 }
 
+// FIX 1: Proper odds validation — rejects 0, +40, and other garbage lines
 function isGoodValue(odds, sport, betType) {
+  if(!odds || odds === 0) return false;
+  // Positive odds must be at least +100 to be real
+  if(odds > 0 && odds < 100) return false;
   if(betType === 'ML') {
     const minOdds = ML_ODDS_FILTERS[sport] || -200;
-    return odds >= minOdds && odds < 500;
+    return odds >= minOdds && odds <= 500;
   }
-  return odds > -200 && odds < 500;
+  // Spreads and totals: no worse than -200, no better than +500
+  return odds >= -200 && odds <= 500;
 }
 
 function roundToHalf(num) { return Math.round(num * 2) / 2; }
@@ -339,7 +363,10 @@ function getAverageOdds(bookmakers, team, market) {
     if(m) { const o = m.outcomes.find(o => o.name === team); if(o) odds.push(o.price); }
   });
   if(odds.length === 0) return null;
-  return Math.round(odds.reduce((a,b) => a+b,0) / odds.length);
+  const avg = Math.round(odds.reduce((a,b) => a+b,0) / odds.length);
+  // Extra safety: if average comes out to 0 or a nonsense positive, reject it
+  if(avg === 0 || (avg > 0 && avg < 100)) return null;
+  return avg;
 }
 
 function getAveragePoint(bookmakers, team, market) {
@@ -420,6 +447,51 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
   return `Strong play — ${conf}% confidence at ${formattedOdds}. ${randomContext}`;
 }
 
+// ─── SAVE PICKS TO SUPABASE (used by /trigger-picks) ─────────────────────────
+async function saveAllPicks(allPicks) {
+  if(!supabase) return;
+  const fortyEightHoursAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
+  for(const [sport, picks] of Object.entries(allPicks)) {
+    if(!Array.isArray(picks)) continue;
+    for(const pick of picks) {
+      if(!pick.name || pick.name === 'Pro Pick' || pick.name === 'Check back at next update') continue;
+      try {
+        // FIX 3: Dedup using 48hr window + bet_type
+        const { data: existing } = await supabase
+          .from('picks_history')
+          .select('id')
+          .eq('sport', sport)
+          .eq('pick_name', pick.name)
+          .eq('game', pick.game)
+          .eq('bet_type', pick.type || 'ML')
+          .gte('created_at', fortyEightHoursAgo)
+          .limit(1);
+
+        if(!existing || existing.length === 0) {
+          await supabase.from('picks_history').insert({
+            sport,
+            game: pick.game,
+            pick_name: pick.name,
+            odds: pick.odds,
+            confidence: pick.conf,
+            bet_type: pick.type || 'ML',
+            game_time: pick.gameTime,
+            result: 'pending',
+            is_free: pick.free,
+            commence_time: pick.gameTime
+          });
+          console.log(`✓ Saved: ${pick.name}`);
+        } else {
+          console.log(`⟳ Skipped duplicate: ${pick.name}`);
+        }
+      } catch(e) {
+        console.log('Save error:', e.message);
+      }
+    }
+  }
+}
+
 // ─── PICKS GENERATION ─────────────────────────────────────────────────────────
 async function getPicksForSport(sportKey, sportLabel, sport) {
   const now = new Date();
@@ -442,12 +514,13 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
     pitcherMap = await fetchMLBPitcherData();
   }
 
+  // ML picks
   futureH2h.forEach(game => {
     [game.home_team, game.away_team].forEach(team => {
       const odds = getAverageOdds(game.bookmakers, team, 'h2h');
-      if(!odds) return;
+      if(!odds || !isGoodValue(odds, sport, 'ML')) return;
       const conf = Math.round(americanToImpliedProb(odds) * 100);
-      if(conf < confThreshold || !isGoodValue(odds, sport, 'ML')) return;
+      if(conf < confThreshold) return;
       const isHome = team === game.home_team;
       const opponent = isHome ? game.away_team : game.home_team;
       let valueScore = conf - Math.abs(odds) / 10;
@@ -463,15 +536,23 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
     });
   });
 
+  // Spread picks
   futureSpread.forEach(game => {
     [game.home_team, game.away_team].forEach(team => {
       const odds = getAverageOdds(game.bookmakers, team, 'spreads');
       const rawPoint = getAveragePoint(game.bookmakers, team, 'spreads');
-      if(!odds || rawPoint === null) return;
+      if(!odds || rawPoint === null || !isGoodValue(odds, sport, 'SPREAD')) return;
       const point = roundToHalf(rawPoint);
-      if(Math.abs(point) < 0.5) return;
+
+      // FIX 2: MLB run lines and NHL puck lines are always exactly ±1.5
+      if(sport === 'mlb' || sport === 'nhl') {
+        if(Math.abs(point) !== 1.5) return;
+      }
+      // NBA: spreads must be at least 1.5
+      if(sport === 'nba' && Math.abs(point) < 1.5) return;
+
       const conf = Math.round(americanToImpliedProb(odds) * 100);
-      if(conf < confThreshold || !isGoodValue(odds, sport, 'SPREAD')) return;
+      if(conf < confThreshold) return;
       const isHome = team === game.home_team;
       const opponent = isHome ? game.away_team : game.home_team;
       let valueScore = conf - Math.abs(odds) / 10;
@@ -488,20 +569,19 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
     });
   });
 
+  // Totals picks
   futureTotals.forEach(game => {
     ['Over', 'Under'].forEach(direction => {
       const odds = getAverageOdds(game.bookmakers, direction, 'totals');
       const rawPoint = getAveragePoint(game.bookmakers, direction, 'totals');
-      if(!odds || rawPoint === null) return;
+      if(!odds || rawPoint === null || !isGoodValue(odds, sport, 'TOTAL')) return;
       const point = roundToHalf(rawPoint);
       const conf = Math.round(americanToImpliedProb(odds) * 100);
-      if(conf < confThreshold || !isGoodValue(odds, sport, 'TOTAL')) return;
+      if(conf < confThreshold) return;
       let valueScore = conf - Math.abs(odds) / 10;
       if(sport === 'mlb') {
-        const homeTeam = game.home_team;
-        const awayTeam = game.away_team;
-        const homePitcher = pitcherMap[homeTeam];
-        const awayPitcher = pitcherMap[awayTeam];
+        const homePitcher = pitcherMap[game.home_team];
+        const awayPitcher = pitcherMap[game.away_team];
         if(homePitcher?.era && awayPitcher?.era) {
           const combinedERA = parseFloat(homePitcher.era) + parseFloat(awayPitcher.era);
           if(direction === 'Under' && combinedERA < 7) valueScore += 6;
@@ -529,15 +609,16 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
     if(unique.length >= 3) break;
   }
 
+  // Fallback: lower confidence threshold if not enough picks
   if(unique.length < 3) {
     const existingKeys = new Set(unique.map(p => p.game + p.type));
     const lowCandidates = [];
     futureH2h.forEach(game => {
       [game.home_team, game.away_team].forEach(team => {
         const odds = getAverageOdds(game.bookmakers, team, 'h2h');
-        if(!odds) return;
+        if(!odds || !isGoodValue(odds, sport, 'ML')) return;
         const conf = Math.round(americanToImpliedProb(odds) * 100);
-        if(conf < 55 || !isGoodValue(odds, sport, 'ML')) return;
+        if(conf < 55) return;
         const key = `${sportLabel} · ${game.home_team} vs ${game.away_team}h2h`;
         if(existingKeys.has(key)) return;
         const isHome = team === game.home_team;
@@ -563,8 +644,8 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
   const colors = ['#FFD700', '#C0C0C0', '#CD7F32'];
   return unique.map((pick, i) => ({
     badge: badges[i], color: colors[i], game: pick.game, name: pick.name,
-    odds: formatOdds(pick.odds), conf: pick.conf, free: i === 2,
-    type: pick.label, gameTime: pick.gameTime, analysis: pick.analysis
+    odds: formatOdds(pick.odds), conf: Math.min(pick.conf, 85), // Cap confidence at 85% for display
+    free: i === 2, type: pick.label, gameTime: pick.gameTime, analysis: pick.analysis
   }));
 }
 
@@ -588,9 +669,9 @@ async function generatePicks() {
       upcomingFights.forEach(game => {
         [game.home_team, game.away_team].forEach(team => {
           const odds = getAverageOdds(game.bookmakers, team, 'h2h');
-          if(!odds) return;
+          if(!odds || !isGoodValue(odds, 'ufc', 'ML')) return;
           const conf = Math.round(americanToImpliedProb(odds) * 100);
-          if(conf < 55 || !isGoodValue(odds, 'ufc', 'ML')) return;
+          if(conf < 55) return;
           const opponent = team === game.home_team ? game.away_team : game.home_team;
           fights.push({
             game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`,
@@ -608,8 +689,8 @@ async function generatePicks() {
       const colors = ['#FFD700','#C0C0C0','#CD7F32'];
       allPicks['ufc'] = top3.map((f,i) => ({
         badge: badges[i], color: colors[i], game: f.game, name: f.name,
-        odds: formatOdds(f.odds), conf: f.conf, free: i === 2,
-        type: 'ML', gameTime: f.gameTime, analysis: f.analysis
+        odds: formatOdds(f.odds), conf: Math.min(f.conf, 85), // Cap at 85%
+        free: i === 2, type: 'ML', gameTime: f.gameTime, analysis: f.analysis
       }));
       continue;
     }
