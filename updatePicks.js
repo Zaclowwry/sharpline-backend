@@ -35,7 +35,16 @@ function americanToImpliedProb(odds) {
 }
 
 function formatOdds(odds) { return odds > 0 ? `+${odds}` : `${odds}`; }
-function isGoodValue(odds) { return odds > -200 && odds < 500; }
+
+// FIX 1: Proper odds validation — blocks garbage lines like 0, +40, etc.
+// Valid American odds are either negative (-105 to -200) or positive (+100 to +500)
+function isGoodValue(odds) {
+  if (odds === 0) return false;
+  if (odds < 0) return odds >= -200; // e.g. -105, -150, -200 ✓ | -300 ✗
+  if (odds > 0) return odds >= 100 && odds <= 500; // e.g. +110, +250 ✓ | +40 ✗
+  return false;
+}
+
 function roundToHalf(num) { return Math.round(num * 2) / 2; }
 
 function getAverageOdds(bookmakers, team, market) {
@@ -45,7 +54,10 @@ function getAverageOdds(bookmakers, team, market) {
     if(m) { const o = m.outcomes.find(o => o.name === team); if(o) odds.push(o.price); }
   });
   if(odds.length === 0) return null;
-  return Math.round(odds.reduce((a,b) => a+b,0) / odds.length);
+  const avg = Math.round(odds.reduce((a,b) => a+b,0) / odds.length);
+  // Extra safety: return null if averaged result is still invalid
+  if (avg === 0 || (avg > 0 && avg < 100)) return null;
+  return avg;
 }
 
 function getAveragePoint(bookmakers, team, market) {
@@ -60,7 +72,11 @@ function getAveragePoint(bookmakers, team, market) {
 
 async function savePick(sport, pick) {
   if(!pick.name || pick.name === 'Pro Pick' || pick.name === 'Check back at next update') return;
-  const today = new Date().toISOString().split('T')[0];
+
+  // FIX 3: Use a 48-hour rolling window instead of just today's date
+  // This prevents duplicates across midnight boundaries
+  const fortyEightHoursAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+
   try {
     const { data: existing } = await supabase
       .from('picks_history')
@@ -68,8 +84,10 @@ async function savePick(sport, pick) {
       .eq('sport', sport)
       .eq('pick_name', pick.name)
       .eq('game', pick.game)
-      .gte('created_at', `${today}T00:00:00.000Z`)
+      .eq('bet_type', pick.type || 'ML')   // FIX 3: also match bet_type to prevent type-level dupes
+      .gte('created_at', fortyEightHoursAgo)
       .limit(1);
+
     if(!existing || existing.length === 0) {
       await supabase.from('picks_history').insert({
         sport, game: pick.game, pick_name: pick.name,
@@ -106,14 +124,18 @@ async function generateAndSavePicks() {
         upcomingFights.forEach(game => {
           [game.home_team, game.away_team].forEach(team => {
             const odds = getAverageOdds(game.bookmakers, team, 'h2h');
-            if(!odds) return;
+            if(!odds || !isGoodValue(odds)) return;
             const conf = Math.round(americanToImpliedProb(odds) * 100);
-            if(conf < 55 || !isGoodValue(odds)) return;
-            fights.push({ game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`, name: `${team} ML`, odds, conf, valueScore: conf - Math.abs(odds)/10, gameTime: game.commence_time, type: 'ML' });
+            if(conf < 55) return;
+            fights.push({
+              game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`,
+              name: `${team} ML`, odds, conf,
+              valueScore: conf - Math.abs(odds)/10,
+              gameTime: game.commence_time, type: 'ML'
+            });
           });
         });
         fights.sort((a,b) => b.valueScore - a.valueScore);
-        const badges = ['🥇 BEST BET','🥈 STRONG PLAY','🥉 VALUE BET'];
         for(let i=0; i<Math.min(3, fights.length); i++) {
           await savePick('ufc', { ...fights[i], free: i===2, odds: formatOdds(fights[i].odds) });
         }
@@ -131,36 +153,71 @@ async function generateAndSavePicks() {
       const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
       const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
 
+      // Confidence thresholds per sport
+      const mlConfThreshold = sport === 'mlb' ? 65 : 60;
+      const spreadConfThreshold = sport === 'mlb' ? 65 : 60;
+      const totalConfThreshold = sport === 'mlb' ? 65 : 60;
+
+      // ML picks
       futureH2h.forEach(game => {
         [game.home_team, game.away_team].forEach(team => {
           const odds = getAverageOdds(game.bookmakers, team, 'h2h');
-          if(!odds) return;
+          if(!odds || !isGoodValue(odds)) return;
           const conf = Math.round(americanToImpliedProb(odds) * 100);
-          if(conf < 60 || !isGoodValue(odds)) return;
-          const isHome = team === game.home_team;
-          allCandidates.push({ type: 'ML', label: 'ML', gameTime: game.commence_time, game: `${SPORT_LABELS[sport]} · ${game.home_team} vs ${game.away_team}`, name: `${team} ML`, odds, conf, valueScore: conf - Math.abs(odds)/10 });
+          if(conf < mlConfThreshold) return;
+          allCandidates.push({
+            type: 'ML', label: 'ML',
+            gameTime: game.commence_time,
+            game: `${SPORT_LABELS[sport]} · ${game.home_team} vs ${game.away_team}`,
+            name: `${team} ML`, odds, conf,
+            valueScore: conf - Math.abs(odds)/10
+          });
         });
       });
 
+      // Spread picks
       futureSpread.forEach(game => {
         [game.home_team, game.away_team].forEach(team => {
           const odds = getAverageOdds(game.bookmakers, team, 'spreads');
           const point = getAveragePoint(game.bookmakers, team, 'spreads');
-          if(!odds || point === null || Math.abs(point) < 0.5) return;
+          if(!odds || point === null || !isGoodValue(odds)) return;
+
+          // FIX 2: MLB run lines and NHL puck lines are always ±1.5 — enforce it
+          if (sport === 'mlb' || sport === 'nhl') {
+            if (Math.abs(point) !== 1.5) return;
+          }
+          // NBA: spreads should be meaningful (at least 1.5 points)
+          if (sport === 'nba' && Math.abs(point) < 1.5) return;
+
           const conf = Math.round(americanToImpliedProb(odds) * 100);
-          if(conf < 60 || !isGoodValue(odds)) return;
-          allCandidates.push({ type: 'SPREAD', label: 'SPREAD', gameTime: game.commence_time, game: `${SPORT_LABELS[sport]} · ${game.home_team} vs ${game.away_team}`, name: `${team} ${point > 0 ? '+' : ''}${point}`, odds, conf, valueScore: conf - Math.abs(odds)/10 });
+          if(conf < spreadConfThreshold) return;
+          allCandidates.push({
+            type: 'SPREAD', label: 'SPREAD',
+            gameTime: game.commence_time,
+            game: `${SPORT_LABELS[sport]} · ${game.home_team} vs ${game.away_team}`,
+            name: `${team} ${point > 0 ? '+' : ''}${point}`,
+            odds, conf,
+            valueScore: conf - Math.abs(odds)/10
+          });
         });
       });
 
+      // Totals picks
       futureTotals.forEach(game => {
         ['Over', 'Under'].forEach(direction => {
           const odds = getAverageOdds(game.bookmakers, direction, 'totals');
           const point = getAveragePoint(game.bookmakers, direction, 'totals');
-          if(!odds || point === null) return;
+          if(!odds || point === null || !isGoodValue(odds)) return;
           const conf = Math.round(americanToImpliedProb(odds) * 100);
-          if(conf < 60 || !isGoodValue(odds)) return;
-          allCandidates.push({ type: 'TOTAL', label: 'TOTAL', gameTime: game.commence_time, game: `${SPORT_LABELS[sport]} · ${game.home_team} vs ${game.away_team}`, name: `${direction} ${point}`, odds, conf, valueScore: conf - Math.abs(odds)/10 });
+          if(conf < totalConfThreshold) return;
+          allCandidates.push({
+            type: 'TOTAL', label: 'TOTAL',
+            gameTime: game.commence_time,
+            game: `${SPORT_LABELS[sport]} · ${game.home_team} vs ${game.away_team}`,
+            name: `${direction} ${point}`,
+            odds, conf,
+            valueScore: conf - Math.abs(odds)/10
+          });
         });
       });
 
