@@ -64,21 +64,15 @@ app.get('/', (req, res) => {
 });
 
 // ─── MANUAL TRIGGER ───────────────────────────────────────────────────────────
-// Hit GET /trigger-picks to force a fresh pick generation and save to Supabase
 app.get('/trigger-picks', async (req, res) => {
   try {
     console.log('Manual pick trigger fired...');
-    // Clear cache so /picks also returns fresh data
     cachedPicks = null;
     lastUpdated = null;
-
     const picks = await generatePicks();
     cachedPicks = picks;
     lastUpdated = new Date();
-
-    // Also save to picks_history (same as cron job)
     await saveAllPicks(picks);
-
     res.json({ success: true, updatedAt: lastUpdated, picks });
   } catch(e) {
     console.log('Trigger error:', e.message);
@@ -341,16 +335,13 @@ function formatOdds(odds) {
   return rounded > 0 ? `+${rounded}` : `${rounded}`;
 }
 
-// FIX 1: Proper odds validation — rejects 0, +40, and other garbage lines
 function isGoodValue(odds, sport, betType) {
   if(!odds || odds === 0) return false;
-  // Positive odds must be at least +100 to be real
   if(odds > 0 && odds < 100) return false;
   if(betType === 'ML') {
     const minOdds = ML_ODDS_FILTERS[sport] || -200;
     return odds >= minOdds && odds <= 500;
   }
-  // Spreads and totals: no worse than -200, no better than +500
   return odds >= -200 && odds <= 500;
 }
 
@@ -364,7 +355,6 @@ function getAverageOdds(bookmakers, team, market) {
   });
   if(odds.length === 0) return null;
   const avg = Math.round(odds.reduce((a,b) => a+b,0) / odds.length);
-  // Extra safety: if average comes out to 0 or a nonsense positive, reject it
   if(avg === 0 || (avg > 0 && avg < 100)) return null;
   return avg;
 }
@@ -380,84 +370,171 @@ function getAveragePoint(bookmakers, team, market) {
 }
 
 // ─── SMART ANALYSIS ───────────────────────────────────────────────────────────
+function rnd(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
+
 function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, sport, bookmakerCount, pitcherContext) {
-  const location = isHome ? 'at home' : 'on the road';
   const formattedOdds = formatOdds(odds);
-  const sharpConsensus = bookmakerCount >= 5 ? 'Wide bookmaker consensus supports this line.' : 'Multiple books agree on this line.';
-  const homeEdge = isHome ? 'Home court/ice advantage is a significant factor here.' : 'Road teams covering at this number have been profitable this season.';
+  const sharpLine = bookmakerCount >= 5
+    ? 'Consensus across 5+ books strengthens this number.'
+    : 'Multiple sportsbooks are aligned on this line.';
 
-  const nbaContext = [
-    'Back-to-back fatigue is a key situational factor in this spot.',
-    'This line has moved in favor of our pick since opening — sharp money agrees.',
-    'Rest advantage plays heavily into our model\'s confidence here.',
-    'The pace matchup heavily favors this pick based on recent trends.',
-    'Injury reports favor our side — key player availability shifts the line value.',
-    'This team has been significantly better against the spread at home this season.',
-    'Recent form over the last 5 games strongly supports this pick.'
-  ];
-
-  const mlbContext = pitcherContext ? [pitcherContext] : [
-    'Starting pitcher matchup heavily favors our side today.',
-    'Bullpen strength and recent usage patterns support this pick.',
-    'Ballpark factors and weather conditions align with our model.',
-    'This lineup has been dominant against right/left-handed pitching recently.',
-    'Run differential over the last 10 games supports this total.'
-  ];
-
-  const nhlContext = [
-    'Goaltender save percentage over the last 10 games drives this pick.',
-    'Power play efficiency and penalty kill matchup favor our side.',
-    'Back-to-back road game fatigue is a key factor in our model.',
-    'Home ice advantage and crowd factor heavily weighted here.',
-    'Recent form over last 5 games shows a clear directional edge.',
-    'This team leads the league in shots on goal over the last 2 weeks.'
-  ];
-
-  const ufcContext = [
-    'Striking accuracy and takedown defense heavily favor our pick.',
-    'Fighter\'s recent performance and training camp reports support this line.',
-    'Style matchup analysis strongly favors our pick in this bout.',
-    'Cardio and late-round performance trends favor our fighter.',
-    'Weight cut and camp situation create a significant edge here.',
-    'This fighter has finished their last 3 opponents — finishing ability is a key factor.'
-  ];
-
-  const contextMap = { nba: nbaContext, mlb: mlbContext, nhl: nhlContext, ufc: ufcContext };
-  const contexts = contextMap[sport] || nbaContext;
-  const randomContext = contexts[Math.floor(Math.random() * contexts.length)];
-
-  if(pickType === 'h2h') {
-    if(conf >= 75) return `${team} is a strong ${conf}% favorite ${location}. ${randomContext} ${sharpConsensus} One of the strongest moneylines on today's board.`;
-    if(conf >= 65) return `${team} is favored at ${conf}% ${location}. ${randomContext} ${homeEdge} Solid value at ${formattedOdds}.`;
-    return `${team} at ${formattedOdds} offers real value ${location}. ${randomContext} At ${conf}% implied probability this is a smart play with legitimate upside.`;
+  // ── NBA ──────────────────────────────────────────────────────────────────────
+  if(sport === 'nba') {
+    const loc = isHome ? 'at home' : 'on the road';
+    const homeNote = isHome
+      ? `${team} have been significantly stronger at home this season — the crowd and familiarity with the floor matter here.`
+      : `${team} have quietly been one of the better road teams this season, keeping games close away from home.`;
+    const situational = rnd([
+      `Rest advantage is a real factor — ${team} are the fresher team heading into tonight.`,
+      `Back-to-back fatigue could be an issue for ${opponent}, and ${team} are well-rested.`,
+      `Line movement since open has favored ${team} — sharp money is on this side.`,
+      `The pace of play in this matchup suits ${team}'s style — they thrive at this tempo.`,
+      `${team} have covered consistently against this level of competition recently.`,
+      `Key injury reports favor ${team} — depth and availability give them a real edge tonight.`,
+      `${opponent} are struggling with defensive consistency, which plays right into ${team}'s hands.`
+    ]);
+    if(pickType === 'h2h') {
+      if(conf >= 75) return `${team} are a strong favorite ${loc} tonight. ${situational} ${sharpLine}`;
+      if(conf >= 65) return `${team} are favored ${loc} at ${formattedOdds}. ${homeNote} ${situational}`;
+      return `${team} at ${formattedOdds} ${loc} is a value play the model likes. ${situational} At ${conf}% implied probability, there's real upside here.`;
+    }
+    if(pickType === 'spreads') {
+      const sp = point > 0 ? `+${point}` : `${point}`;
+      if(conf >= 75) return `${team} ${sp} is one of the stronger spread plays on tonight's board. ${situational} ${sharpLine}`;
+      if(conf >= 65) return `${team} ${sp} at ${formattedOdds} is a solid play. ${homeNote} ${situational}`;
+      return `${team} ${sp} at ${formattedOdds} offers value. ${situational} Good spot to be on this number.`;
+    }
+    if(pickType === 'totals') {
+      const overNotes = [
+        `Both ${team} and ${opponent} have been running up the score lately — pace and defensive lapses point to a high-scoring game.`,
+        `Neither team has strong defensive efficiency numbers right now. Expect buckets early and often.`,
+        `This matchup historically trends over — both offenses are clicking and the total feels low.`
+      ];
+      const underNotes = [
+        `Both teams have slowed pace recently and lean on halfcourt sets — a lower-scoring game is likely.`,
+        `Defensive matchups favor the under here — both teams give up fewer points when fully healthy.`,
+        `${opponent} and ${team} have both gone under in their recent outings. The total looks inflated.`
+      ];
+      return `${team} ${point} at ${formattedOdds}. ${rnd(team === 'Over' ? overNotes : underNotes)} ${sharpLine}`;
+    }
   }
-  if(pickType === 'spreads') {
-    const spreadStr = point > 0 ? `+${point}` : `${point}`;
-    if(conf >= 75) return `${team} ${spreadStr} is one of the strongest spread plays today. ${randomContext} ${sharpConsensus} Sharp money has been consistent on this number.`;
-    if(conf >= 65) return `${team} ${spreadStr} is a solid spread play at ${formattedOdds}. ${randomContext} ${homeEdge} Line movement supports this pick.`;
-    return `${team} ${spreadStr} at ${formattedOdds} offers value. ${randomContext} Good spot to be on this side of the number.`;
+
+  // ── MLB ──────────────────────────────────────────────────────────────────────
+  if(sport === 'mlb') {
+    const loc = isHome ? 'at home' : 'away';
+    if(pickType === 'h2h' || pickType === 'spreads') {
+      const sp = (pickType === 'spreads' && point !== null) ? (point > 0 ? ` +${point}` : ` ${point}`) : '';
+      const pitcherNote = pitcherContext || rnd([
+        `The starting pitcher matchup tilts heavily in ${team}'s favor today.`,
+        `${team}'s bullpen has been one of the most reliable in the league over the last two weeks.`,
+        `${opponent}'s rotation is stretched thin — ${team} are well-rested and ready to take advantage.`,
+        `${team} have been dominant at the plate against this type of pitching recently.`
+      ]);
+      const situational = rnd([
+        `Run differential over the last 10 games strongly favors ${team}.`,
+        `${team} have been excellent in one-run games — exactly the spot this model targets.`,
+        `Ballpark factors and wind conditions today favor ${team}'s offense.`,
+        `${team} have been one of the better bets ${loc} this season — their splits are impressive.`,
+        `${opponent} has struggled to score when facing quality arms, and today that's a problem for them.`
+      ]);
+      if(conf >= 75) return `${team}${sp} is one of the stronger MLB plays today. ${pitcherNote} ${situational} ${sharpLine}`;
+      if(conf >= 65) return `${team}${sp} at ${formattedOdds} is a solid play. ${pitcherNote} ${situational}`;
+      return `${team}${sp} at ${formattedOdds} offers value. ${pitcherNote} ${situational}`;
+    }
+    if(pickType === 'totals') {
+      const pitcherNote = pitcherContext ? pitcherContext + ' ' : '';
+      const overNotes = [
+        `Both offenses have been productive lately and neither starter has elite strikeout stuff today.`,
+        `The ballpark plays to hitters in today's conditions — wind and temperature should push this over.`,
+        `${team} and ${opponent} have combined for big run totals in their recent matchups.`
+      ];
+      const underNotes = [
+        `Two quality arms on the mound today — run support has been scarce for both teams lately.`,
+        `Bullpen depth gives both managers options to keep this one close and low-scoring.`,
+        `Both teams have gone under in their last several games. The total looks slightly inflated.`
+      ];
+      return `${team} ${point} at ${formattedOdds}. ${pitcherNote}${rnd(team === 'Over' ? overNotes : underNotes)} ${sharpLine}`;
+    }
   }
-  if(pickType === 'totals') {
-    const direction = team === 'Over' ? 'Over' : 'Under';
-    const directionLower = direction.toLowerCase();
-    if(conf >= 75) return `${direction} ${point} is one of the strongest totals plays today. ${randomContext} ${sharpConsensus} Pace and matchup data strongly support the ${directionLower}.`;
-    if(conf >= 65) return `${direction} ${point} at ${formattedOdds} is a solid play. ${randomContext} Recent scoring trends support the ${directionLower} in this matchup.`;
-    return `${direction} ${point} at ${formattedOdds} offers value. ${randomContext} Situational factors favor the ${directionLower} in this spot.`;
+
+  // ── NHL ──────────────────────────────────────────────────────────────────────
+  if(sport === 'nhl') {
+    const loc = isHome ? 'at home' : 'on the road';
+    const homeNote = isHome
+      ? `${team} have been tough to beat on home ice this season — crowd noise and familiarity with the rink are real factors.`
+      : `${team} have shown they can win away from home, which is exactly the kind of spot this model targets.`;
+    const situational = rnd([
+      `${team}'s goaltender has been one of the sharper options in the league over the last 10 games — the save percentage backs it up.`,
+      `Power play efficiency heavily favors ${team} in this matchup — ${opponent}'s penalty kill has been leaky.`,
+      `${opponent} is on the second night of a back-to-back — fatigue is a real concern heading into this one.`,
+      `${team} leads the league in shots on goal over the last two weeks — they've been generating and converting.`,
+      `Recent form strongly favors ${team} — they've been the more complete team over their last 5 games.`,
+      `${team}'s defensive structure has been elite lately, keeping games tight and favoring puck possession.`,
+      `Line movement since open has trended toward ${team} — sharp money agrees with this number.`
+    ]);
+    if(pickType === 'h2h') {
+      if(conf >= 75) return `${team} are a strong play ${loc} tonight. ${situational} ${sharpLine}`;
+      if(conf >= 65) return `${team} at ${formattedOdds} ${loc} is a solid play. ${homeNote} ${situational}`;
+      return `${team} at ${formattedOdds} offers value ${loc}. ${situational} At ${conf}% implied probability, this is a smart spot.`;
+    }
+    if(pickType === 'spreads') {
+      const sp = point > 0 ? `+${point}` : `${point}`;
+      if(conf >= 75) return `${team} ${sp} is one of the stronger puck line plays today. ${situational} ${sharpLine}`;
+      if(conf >= 65) return `${team} ${sp} at ${formattedOdds} is a solid play. ${homeNote} ${situational}`;
+      return `${team} ${sp} at ${formattedOdds} offers value. ${situational}`;
+    }
+    if(pickType === 'totals') {
+      const overNotes = [
+        `Both teams have been involved in high-event games lately — expect pace, shots, and goals.`,
+        `Goaltending has been shaky on both sides recently — this total feels low given recent form.`,
+        `Penalty trouble for both squads sets up power play opportunities that tend to push totals higher.`
+      ];
+      const underNotes = [
+        `Two of the sharper goaltenders in the league square off tonight — goals will be hard to come by.`,
+        `Both teams have been playing tight, defensive hockey lately. The under has cashed in their recent games.`,
+        `Slow-paced matchup expected — both coaches favor structure over run-and-gun. The under fits the profile.`
+      ];
+      return `${team} ${point} at ${formattedOdds}. ${rnd(team === 'Over' ? overNotes : underNotes)} ${sharpLine}`;
+    }
   }
-  return `Strong play — ${conf}% confidence at ${formattedOdds}. ${randomContext}`;
+
+  // ── UFC ──────────────────────────────────────────────────────────────────────
+  if(sport === 'ufc') {
+    const oddsNote = odds < 0
+      ? `${team} is the favorite at ${formattedOdds} — the books see a clear edge here and our model agrees.`
+      : `${team} comes in as the underdog at ${formattedOdds}, but the value is there and the model likes this spot.`;
+    const styleNote = rnd([
+      `${team}'s striking accuracy and distance control give them a clear edge against ${opponent} in this matchup.`,
+      `The grappling and takedown defense for ${team} has been elite — ${opponent} will struggle to impose their game plan.`,
+      `${team} has looked sharp in recent outings, finishing opponents and showing no signs of slowing down heading into this fight.`,
+      `Style-wise, this is a favorable matchup for ${team} — ${opponent}'s tendencies play right into their strengths.`,
+      `${team} has been finishing fights lately — their pressure and aggression late in rounds has been the defining factor.`,
+      `Cardio and late-round performance is where ${team} separates — if this goes deep, it heavily favors them.`,
+      `${team}'s camp has clearly game-planned around ${opponent}'s tendencies — they're prepared for this fight.`,
+      `${opponent} has shown some defensive holes that ${team} is well-equipped to exploit on fight night.`
+    ]);
+    const closingNote = rnd([
+      `This line has moved toward ${team} since opening — sharp money is backing this pick.`,
+      sharpLine,
+      `Our model has ${team} as the more complete fighter heading into fight night.`,
+      `At ${conf}% implied probability, the model sees enough value to make this a confident play.`
+    ]);
+    return `${oddsNote} ${styleNote} ${closingNote}`;
+  }
+
+  // ── Fallback ─────────────────────────────────────────────────────────────────
+  return `Strong play — ${conf}% confidence at ${formattedOdds}. ${sharpLine}`;
 }
 
-// ─── SAVE PICKS TO SUPABASE (used by /trigger-picks) ─────────────────────────
+// ─── SAVE PICKS TO SUPABASE ───────────────────────────────────────────────────
 async function saveAllPicks(allPicks) {
   if(!supabase) return;
   const fortyEightHoursAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
-
   for(const [sport, picks] of Object.entries(allPicks)) {
     if(!Array.isArray(picks)) continue;
     for(const pick of picks) {
       if(!pick.name || pick.name === 'Pro Pick' || pick.name === 'Check back at next update') continue;
       try {
-        // FIX 3: Dedup using 48hr window + bet_type
         const { data: existing } = await supabase
           .from('picks_history')
           .select('id')
@@ -467,19 +544,12 @@ async function saveAllPicks(allPicks) {
           .eq('bet_type', pick.type || 'ML')
           .gte('created_at', fortyEightHoursAgo)
           .limit(1);
-
         if(!existing || existing.length === 0) {
           await supabase.from('picks_history').insert({
-            sport,
-            game: pick.game,
-            pick_name: pick.name,
-            odds: pick.odds,
-            confidence: pick.conf,
-            bet_type: pick.type || 'ML',
-            game_time: pick.gameTime,
-            result: 'pending',
-            is_free: pick.free,
-            commence_time: pick.gameTime
+            sport, game: pick.game, pick_name: pick.name,
+            odds: pick.odds, confidence: pick.conf,
+            bet_type: pick.type || 'ML', game_time: pick.gameTime,
+            result: 'pending', is_free: pick.free, commence_time: pick.gameTime
           });
           console.log(`✓ Saved: ${pick.name}`);
         } else {
@@ -510,9 +580,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
   const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
 
   let pitcherMap = {};
-  if(sport === 'mlb') {
-    pitcherMap = await fetchMLBPitcherData();
-  }
+  if(sport === 'mlb') pitcherMap = await fetchMLBPitcherData();
 
   // ML picks
   futureH2h.forEach(game => {
@@ -543,14 +611,10 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
       const rawPoint = getAveragePoint(game.bookmakers, team, 'spreads');
       if(!odds || rawPoint === null || !isGoodValue(odds, sport, 'SPREAD')) return;
       const point = roundToHalf(rawPoint);
-
-      // FIX 2: MLB run lines and NHL puck lines are always exactly ±1.5
       if(sport === 'mlb' || sport === 'nhl') {
         if(Math.abs(point) !== 1.5) return;
       }
-      // NBA: spreads must be at least 1.5
       if(sport === 'nba' && Math.abs(point) < 1.5) return;
-
       const conf = Math.round(americanToImpliedProb(odds) * 100);
       if(conf < confThreshold) return;
       const isHome = team === game.home_team;
@@ -609,7 +673,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
     if(unique.length >= 3) break;
   }
 
-  // Fallback: lower confidence threshold if not enough picks
+  // Fallback: lower threshold if not enough picks
   if(unique.length < 3) {
     const existingKeys = new Set(unique.map(p => p.game + p.type));
     const lowCandidates = [];
@@ -644,7 +708,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
   const colors = ['#FFD700', '#C0C0C0', '#CD7F32'];
   return unique.map((pick, i) => ({
     badge: badges[i], color: colors[i], game: pick.game, name: pick.name,
-    odds: formatOdds(pick.odds), conf: Math.min(pick.conf, 85), // Cap confidence at 85% for display
+    odds: formatOdds(pick.odds), conf: Math.min(pick.conf, 85),
     free: i === 2, type: pick.label, gameTime: pick.gameTime, analysis: pick.analysis
   }));
 }
@@ -689,7 +753,7 @@ async function generatePicks() {
       const colors = ['#FFD700','#C0C0C0','#CD7F32'];
       allPicks['ufc'] = top3.map((f,i) => ({
         badge: badges[i], color: colors[i], game: f.game, name: f.name,
-        odds: formatOdds(f.odds), conf: Math.min(f.conf, 85), // Cap at 85%
+        odds: formatOdds(f.odds), conf: Math.min(f.conf, 85),
         free: i === 2, type: 'ML', gameTime: f.gameTime, analysis: f.analysis
       }));
       continue;
