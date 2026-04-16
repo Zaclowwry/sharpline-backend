@@ -7,7 +7,7 @@ const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 3000;
-const ODDS_API_KEY = process.env.ODDS_API_KEY;
+const ODDS_API_KEY = '2033e71d5b6784b9352bfa561db1a576';
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://elwbxwzequrfucujhgsy.supabase.co';
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
@@ -65,9 +65,6 @@ app.get('/', (req, res) => {
 
 // ─── MANUAL TRIGGER ───────────────────────────────────────────────────────────
 app.get('/trigger-picks', async (req, res) => {
-  if(req.query.secret !== process.env.TRIGGER_SECRET) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
   try {
     console.log('Manual pick trigger fired...');
     cachedPicks = null;
@@ -532,7 +529,7 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
 // ─── SAVE PICKS TO SUPABASE ───────────────────────────────────────────────────
 async function saveAllPicks(allPicks) {
   if(!supabase) return;
-  const fortyEightHoursAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
+  const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
   for(const [sport, picks] of Object.entries(allPicks)) {
     if(!Array.isArray(picks)) continue;
     for(const pick of picks) {
@@ -545,7 +542,7 @@ async function saveAllPicks(allPicks) {
           .eq('pick_name', pick.name)
           .eq('game', pick.game)
           .eq('bet_type', pick.type || 'ML')
-          .gte('created_at', fortyEightHoursAgo)
+          .gte('created_at', twelveHoursAgo)
           .limit(1);
         if(!existing || existing.length === 0) {
           await supabase.from('picks_history').insert({
@@ -568,7 +565,7 @@ async function saveAllPicks(allPicks) {
 // ─── PICKS GENERATION ─────────────────────────────────────────────────────────
 async function getPicksForSport(sportKey, sportLabel, sport) {
   const now = new Date();
-  const fortyEightHours = new Date(now.getTime() + 48 * 60 * 60 * 1000);
+  const twelveHours = new Date(now.getTime() + 12 * 60 * 60 * 1000);
   const allCandidates = [];
   const confThreshold = CONFIDENCE_THRESHOLDS[sport] || 60;
 
@@ -578,9 +575,9 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
     fetchOdds(sportKey, 'totals')
   ]);
 
-  const futureH2h = h2hGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
-  const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
-  const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < fortyEightHours && g.bookmakers && g.bookmakers.length >= 2);
+  const futureH2h = h2hGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < twelveHours && g.bookmakers && g.bookmakers.length >= 2);
+  const futureSpread = spreadGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < twelveHours && g.bookmakers && g.bookmakers.length >= 2);
+  const futureTotals = totalGames.filter(g => new Date(g.commence_time) > now && new Date(g.commence_time) < twelveHours && g.bookmakers && g.bookmakers.length >= 2);
 
   let pitcherMap = {};
   if(sport === 'mlb') pitcherMap = await fetchMLBPitcherData();
@@ -599,7 +596,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
       const pitcherContext = sport === 'mlb' ? getPitcherContext(team, opponent, pitcherMap) : null;
       allCandidates.push({
         type: 'h2h', label: 'ML', gameTime: game.commence_time,
-        game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+        game: `${sportLabel} · ${game.away_team} @ ${game.home_team}`,
         name: `${team} ML`, odds, conf, valueScore, isHome, team, opponent,
         bookmakerCount: game.bookmakers.length,
         analysis: generateAnalysis('h2h', team, opponent, conf, odds, null, isHome, sport, game.bookmakers.length, pitcherContext)
@@ -627,7 +624,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
       const pitcherContext = sport === 'mlb' ? getPitcherContext(team, opponent, pitcherMap) : null;
       allCandidates.push({
         type: 'spreads', label: 'SPREAD', gameTime: game.commence_time,
-        game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+        game: `${sportLabel} · ${game.away_team} @ ${game.home_team}`,
         name: `${team} ${point > 0 ? '+' : ''}${point}`,
         odds, conf, valueScore, isHome, team, opponent, point,
         bookmakerCount: game.bookmakers.length,
@@ -658,7 +655,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
       const pitcherContext = sport === 'mlb' ? getPitcherContext(game.home_team, game.away_team, pitcherMap) : null;
       allCandidates.push({
         type: 'totals', label: 'TOTAL', gameTime: game.commence_time,
-        game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+        game: `${sportLabel} · ${game.away_team} @ ${game.home_team}`,
         name: `${direction} ${point}`,
         odds, conf, valueScore, team: direction, opponent: '', point,
         bookmakerCount: game.bookmakers.length,
@@ -693,7 +690,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
         const pitcherContext = sport === 'mlb' ? getPitcherContext(team, opponent, pitcherMap) : null;
         lowCandidates.push({
           type: 'h2h', label: 'ML', gameTime: game.commence_time,
-          game: `${sportLabel} · ${game.home_team} vs ${game.away_team}`,
+          game: `${sportLabel} · ${game.away_team} @ ${game.home_team}`,
           name: `${team} ML`, odds, conf,
           valueScore: conf - Math.abs(odds) / 10,
           isHome, team, opponent,
@@ -741,7 +738,7 @@ async function generatePicks() {
           if(conf < 55) return;
           const opponent = team === game.home_team ? game.away_team : game.home_team;
           fights.push({
-            game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`,
+            game: `🥊 UFC · ${game.away_team} @ ${game.home_team}`,
             name: `${team} ML`, odds, conf,
             valueScore: conf - Math.abs(odds) / 10,
             gameTime: game.commence_time,
