@@ -738,7 +738,7 @@ async function generatePicks() {
           if(conf < 55) return;
           const opponent = team === game.home_team ? game.away_team : game.home_team;
           fights.push({
-            game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`
+            game: `🥊 UFC · ${game.home_team} vs ${game.away_team}`,
             name: `${team} ML`, odds, conf,
             valueScore: conf - Math.abs(odds) / 10,
             gameTime: game.commence_time,
