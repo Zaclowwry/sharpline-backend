@@ -65,6 +65,9 @@ app.get('/', (req, res) => {
 
 // ─── MANUAL TRIGGER ───────────────────────────────────────────────────────────
 app.get('/trigger-picks', async (req, res) => {
+  if(req.query.secret !== process.env.TRIGGER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   try {
     console.log('Manual pick trigger fired...');
     cachedPicks = null;
