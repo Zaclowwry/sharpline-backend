@@ -7,7 +7,7 @@ const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 3000;
-const ODDS_API_KEY = '2033e71d5b6784b9352bfa561db1a576';
+const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://elwbxwzequrfucujhgsy.supabase.co';
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
@@ -65,6 +65,9 @@ app.get('/', (req, res) => {
 
 // ─── MANUAL TRIGGER ───────────────────────────────────────────────────────────
 app.get('/trigger-picks', async (req, res) => {
+  if(req.query.secret !== process.env.TRIGGER_SECRET) {
+    return res.status(401).json({ error: 'Unauthorized' });
+  }
   try {
     console.log('Manual pick trigger fired...');
     cachedPicks = null;
@@ -369,161 +372,240 @@ function getAveragePoint(bookmakers, team, market) {
   return roundToHalf(points.reduce((a,b) => a+b,0) / points.length);
 }
 
-// ─── SMART ANALYSIS ───────────────────────────────────────────────────────────
+// ─── ANALYSIS ENGINE ──────────────────────────────────────────────────────────
 function rnd(arr) { return arr[Math.floor(Math.random() * arr.length)]; }
 
 function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, sport, bookmakerCount, pitcherContext) {
   const formattedOdds = formatOdds(odds);
-  const sharpLine = bookmakerCount >= 5
-    ? 'Consensus across 5+ books strengthens this number.'
-    : 'Multiple sportsbooks are aligned on this line.';
 
-  // ── NBA ──────────────────────────────────────────────────────────────────────
+  // ── CLOSING LINES (shared across sports, fully varied) ────────────────────
+  const closings = [
+    `${bookmakerCount >= 5 ? 'Consensus across 5+ books backs this number' : 'Multiple books are aligned here'} — hard to fade.`,
+    `The model has been tracking this line since open and the value hasn't moved. Still the right side.`,
+    `Sharp action has been consistent on ${team} — this number isn't moving by accident.`,
+    `At ${conf}% implied probability, the edge is real and the model is confident.`,
+    `This is exactly the kind of spot the model was built to find — value where the public isn't looking.`,
+    `Line movement since open has been in ${team}'s favor. Follow the money.`,
+    `${bookmakerCount >= 5 ? 'Five or more books' : 'Multiple books'} pricing this the same way tells you everything you need to know.`,
+    `The model flagged this early and nothing has changed — still the play.`,
+    `Situational edges like this are where the model consistently finds value. Trust the process.`,
+    `Public money is on the other side, which is exactly where we want to be.`
+  ];
+
+  // ── NBA ───────────────────────────────────────────────────────────────────
   if(sport === 'nba') {
     const loc = isHome ? 'at home' : 'on the road';
-    const homeNote = isHome
-      ? `${team} have been significantly stronger at home this season — the crowd and familiarity with the floor matter here.`
-      : `${team} have quietly been one of the better road teams this season, keeping games close away from home.`;
-    const situational = rnd([
-      `Rest advantage is a real factor — ${team} are the fresher team heading into tonight.`,
-      `Back-to-back fatigue could be an issue for ${opponent}, and ${team} are well-rested.`,
-      `Line movement since open has favored ${team} — sharp money is on this side.`,
-      `The pace of play in this matchup suits ${team}'s style — they thrive at this tempo.`,
-      `${team} have covered consistently against this level of competition recently.`,
-      `Key injury reports favor ${team} — depth and availability give them a real edge tonight.`,
-      `${opponent} are struggling with defensive consistency, which plays right into ${team}'s hands.`
-    ]);
-    if(pickType === 'h2h') {
-      if(conf >= 75) return `${team} are a strong favorite ${loc} tonight. ${situational} ${sharpLine}`;
-      if(conf >= 65) return `${team} are favored ${loc} at ${formattedOdds}. ${homeNote} ${situational}`;
-      return `${team} at ${formattedOdds} ${loc} is a value play the model likes. ${situational} At ${conf}% implied probability, there's real upside here.`;
-    }
-    if(pickType === 'spreads') {
-      const sp = point > 0 ? `+${point}` : `${point}`;
-      if(conf >= 75) return `${team} ${sp} is one of the stronger spread plays on tonight's board. ${situational} ${sharpLine}`;
-      if(conf >= 65) return `${team} ${sp} at ${formattedOdds} is a solid play. ${homeNote} ${situational}`;
-      return `${team} ${sp} at ${formattedOdds} offers value. ${situational} Good spot to be on this number.`;
-    }
+
+    const openings = odds < 0 ? [
+      `${team} come into tonight as clear favorites ${loc} and the model sees no reason to argue with that line.`,
+      `The books opened ${team} as favorites ${loc} and sharp money has only pushed it further — that's a signal.`,
+      `${team} are priced as favorites ${loc} at ${formattedOdds} and the model agrees with the market here.`,
+      `At ${formattedOdds}, ${team} represent solid value ${loc} — the implied probability lines up with what the model sees.`,
+      `${team} are favored ${loc} and this is one of the cleaner spots on tonight's board.`
+    ] : [
+      `${team} come in as underdogs ${loc} at ${formattedOdds} but the model sees real value on this side.`,
+      `The public is fading ${team} ${loc}, but at ${formattedOdds} there's too much value to ignore here.`,
+      `${team} at plus money ${loc} is the kind of spot the model loves — undervalued and overlooked.`,
+      `${formattedOdds} on ${team} ${loc} is a number the model can't walk away from. Value play of the day.`,
+      `Underdog alert — ${team} at ${formattedOdds} ${loc} is a genuine value play, not a dart throw.`
+    ];
+
+    const middles = [
+      `${team} have been one of the more consistent teams over their last stretch of games and ${opponent} hasn't shown the ability to slow them down.`,
+      `Rest and scheduling favor ${team} heading into tonight — ${opponent} is the more fatigued side.`,
+      `${team}'s offense has been clicking at a high level lately and ${opponent}'s defense hasn't been able to stop teams with a similar style.`,
+      `Back-to-back fatigue is a real concern for ${opponent} tonight. ${team} are fresh and motivated.`,
+      `The pace of this matchup suits ${team} perfectly — they've thrived in games played at this tempo.`,
+      `${opponent} has been hemorrhaging points on defense lately, and ${team} are exactly the kind of team to expose that.`,
+      `${team} have covered in a majority of their recent matchups against teams at this level. The trend is there.`,
+      `Key rotation players for ${team} are healthy and available, which gives them a real depth advantage over ${opponent} tonight.`,
+      `${team} have been significantly better in close games this season — experience and coaching give them the edge late.`,
+      `${opponent} has been inconsistent offensively and ${team}'s defense is built to make life difficult for exactly that kind of team.`,
+      `The matchup on paper heavily favors ${team} — their personnel advantages are real and the model is pricing them accordingly.`,
+      `${team} have gone on extended runs in recent games and ${opponent} hasn't shown the defensive discipline to slow that down.`
+    ];
+
     if(pickType === 'totals') {
-      const overNotes = [
-        `Both ${team} and ${opponent} have been running up the score lately — pace and defensive lapses point to a high-scoring game.`,
-        `Neither team has strong defensive efficiency numbers right now. Expect buckets early and often.`,
-        `This matchup historically trends over — both offenses are clicking and the total feels low.`
+      const dir = team;
+      const overMids = [
+        `Both ${team} and ${opponent} have been involved in high-scoring games recently — neither defense is stopping much right now.`,
+        `The pace in this matchup will be fast. Both teams push in transition and struggle to set up half-court defense consistently.`,
+        `${opponent} and ${team} have combined to go over this total in a majority of their recent meetings. History favors the over.`,
+        `Neither team's defense has been elite lately — this total feels like it was set for a tighter game than we're likely to get.`,
+        `Both offenses are clicking right now. There aren't many stoppers in this matchup and the points should flow freely.`
       ];
-      const underNotes = [
-        `Both teams have slowed pace recently and lean on halfcourt sets — a lower-scoring game is likely.`,
-        `Defensive matchups favor the under here — both teams give up fewer points when fully healthy.`,
-        `${opponent} and ${team} have both gone under in their recent outings. The total looks inflated.`
+      const underMids = [
+        `Both ${team} and ${opponent} have been leaning on their defenses lately and the scoring has dried up as a result.`,
+        `Slow, halfcourt basketball is what both coaches prefer and this game should reflect that — expect a grind.`,
+        `${opponent} and ${team} have both gone under consistently in recent games. The pace just isn't there for a high scorer.`,
+        `The defensive matchups here are real. Both teams have the personnel to make life difficult for the other's offense.`,
+        `Both teams rank in the bottom half of pace metrics recently. This total feels inflated for what should be a methodical game.`
       ];
-      return `${team} ${point} at ${formattedOdds}. ${rnd(team === 'Over' ? overNotes : underNotes)} ${sharpLine}`;
+      return `${rnd(openings)} ${rnd(dir === 'Over' ? overMids : underMids)} ${rnd(closings)}`;
     }
+
+    return `${rnd(openings)} ${rnd(middles)} ${rnd(closings)}`;
   }
 
-  // ── MLB ──────────────────────────────────────────────────────────────────────
+  // ── MLB ───────────────────────────────────────────────────────────────────
   if(sport === 'mlb') {
-    const loc = isHome ? 'at home' : 'away';
-    if(pickType === 'h2h' || pickType === 'spreads') {
-      const sp = (pickType === 'spreads' && point !== null) ? (point > 0 ? ` +${point}` : ` ${point}`) : '';
-      const pitcherNote = pitcherContext || rnd([
-        `The starting pitcher matchup tilts heavily in ${team}'s favor today.`,
-        `${team}'s bullpen has been one of the most reliable in the league over the last two weeks.`,
-        `${opponent}'s rotation is stretched thin — ${team} are well-rested and ready to take advantage.`,
-        `${team} have been dominant at the plate against this type of pitching recently.`
-      ]);
-      const situational = rnd([
-        `Run differential over the last 10 games strongly favors ${team}.`,
-        `${team} have been excellent in one-run games — exactly the spot this model targets.`,
-        `Ballpark factors and wind conditions today favor ${team}'s offense.`,
-        `${team} have been one of the better bets ${loc} this season — their splits are impressive.`,
-        `${opponent} has struggled to score when facing quality arms, and today that's a problem for them.`
-      ]);
-      if(conf >= 75) return `${team}${sp} is one of the stronger MLB plays today. ${pitcherNote} ${situational} ${sharpLine}`;
-      if(conf >= 65) return `${team}${sp} at ${formattedOdds} is a solid play. ${pitcherNote} ${situational}`;
-      return `${team}${sp} at ${formattedOdds} offers value. ${pitcherNote} ${situational}`;
-    }
+    const loc = isHome ? 'at home' : 'on the road';
+
+    const openings = odds < 0 ? [
+      `${team} are priced as favorites ${loc} at ${formattedOdds} and the model is comfortable backing them here.`,
+      `The books have ${team} as the favorite ${loc} and the underlying data supports that line.`,
+      `${team} at ${formattedOdds} ${loc} is a number that makes sense — the model has them as the more complete side today.`,
+      `Favored ${loc} at ${formattedOdds}, ${team} are the right side according to everything the model is seeing today.`,
+      `${team} come in as favorites ${loc} and this is one of the cleaner plays on today's MLB slate.`
+    ] : [
+      `${team} are the underdog today at ${formattedOdds} but the model sees genuine value on this side.`,
+      `The public is fading ${team} at ${formattedOdds} — that's exactly where the value tends to hide in baseball.`,
+      `${formattedOdds} on ${team} is a number that stands out. The model has this game much closer than the books do.`,
+      `${team} at plus money today is a spot the model flagged early. The value is real.`,
+      `Underdog value alert — ${team} at ${formattedOdds} is a strong play based on what the model sees today.`
+    ];
+
+    const pitcherMids = pitcherContext ? [pitcherContext] : [
+      `The pitching matchup heavily tilts toward ${team} today — the arm they're sending out has been sharp recently.`,
+      `${team}'s starter has been one of the more consistent options in the rotation over the last several weeks.`,
+      `${opponent}'s pitching has been stretched thin lately and ${team} are well-positioned to take advantage today.`,
+      `The bullpen situation favors ${team} — their relievers have been reliable and ${opponent}'s have been shaky.`
+    ];
+
+    const situMids = [
+      `${team} have been excellent in one-run games this season — exactly the kind of spot the model targets.`,
+      `Run differential over the last 10 games strongly favors ${team} and that doesn't happen by accident.`,
+      `${team} have been one of the better bets ${loc} this season — their home/away splits are legitimately impressive.`,
+      `${opponent} has been struggling to score runs against quality pitching and today that's a real problem for them.`,
+      `Ballpark factors and today's conditions suit ${team}'s style of play — this is a favorable environment.`,
+      `${team} have been grinding out wins lately. They don't always look pretty but they find ways to cover.`,
+      `${opponent} has been inconsistent in close games and ${team} know how to win tight ones — experience matters here.`,
+      `The lineup ${team} is running today matches up well against what ${opponent} is throwing out there.`
+    ];
+
     if(pickType === 'totals') {
-      const pitcherNote = pitcherContext ? pitcherContext + ' ' : '';
-      const overNotes = [
-        `Both offenses have been productive lately and neither starter has elite strikeout stuff today.`,
-        `The ballpark plays to hitters in today's conditions — wind and temperature should push this over.`,
-        `${team} and ${opponent} have combined for big run totals in their recent matchups.`
+      const dir = team;
+      const pitNote = pitcherContext ? pitcherContext + ' ' : '';
+      const overMids = [
+        `${pitNote}Both lineups have been swinging the bats well lately and neither starter has been overpowering. Runs should come.`,
+        `${pitNote}The ballpark and today's conditions — wind and temperature — should help drive the ball and push this over.`,
+        `${pitNote}${team} and ${opponent} have been combining for big run totals in recent matchups. This total feels set too low.`,
+        `${pitNote}Neither bullpen has been reliable lately, which means late-inning runs are very much in play here.`,
+        `${pitNote}Both offenses are productive right now and the pitching matchup isn't one that screams shut-down game.`
       ];
-      const underNotes = [
-        `Two quality arms on the mound today — run support has been scarce for both teams lately.`,
-        `Bullpen depth gives both managers options to keep this one close and low-scoring.`,
-        `Both teams have gone under in their last several games. The total looks slightly inflated.`
+      const underMids = [
+        `${pitNote}Two quality arms going today and both bullpens have been solid — run support has been hard to come by for both sides.`,
+        `${pitNote}Both teams have been playing low-scoring ball lately. The under has cashed at a high rate in their recent games.`,
+        `${pitNote}Pitching is winning right now on both sides. This total looks inflated for what should be a tight, low-scoring game.`,
+        `${pitNote}Both managers have deep bullpens and the willingness to go to them early. Runs will be at a premium tonight.`,
+        `${pitNote}The conditions today actually favor pitchers — this total feels half a run too high for the matchup.`
       ];
-      return `${team} ${point} at ${formattedOdds}. ${pitcherNote}${rnd(team === 'Over' ? overNotes : underNotes)} ${sharpLine}`;
+      return `${rnd(openings)} ${rnd(dir === 'Over' ? overMids : underMids)} ${rnd(closings)}`;
     }
+
+    return `${rnd(openings)} ${rnd(pitcherMids)} ${rnd(situMids)} ${rnd(closings)}`;
   }
 
-  // ── NHL ──────────────────────────────────────────────────────────────────────
+  // ── NHL ───────────────────────────────────────────────────────────────────
   if(sport === 'nhl') {
     const loc = isHome ? 'at home' : 'on the road';
-    const homeNote = isHome
-      ? `${team} have been tough to beat on home ice this season — crowd noise and familiarity with the rink are real factors.`
-      : `${team} have shown they can win away from home, which is exactly the kind of spot this model targets.`;
-    const situational = rnd([
-      `${team}'s goaltender has been one of the sharper options in the league over the last 10 games — the save percentage backs it up.`,
-      `Power play efficiency heavily favors ${team} in this matchup — ${opponent}'s penalty kill has been leaky.`,
-      `${opponent} is on the second night of a back-to-back — fatigue is a real concern heading into this one.`,
-      `${team} leads the league in shots on goal over the last two weeks — they've been generating and converting.`,
-      `Recent form strongly favors ${team} — they've been the more complete team over their last 5 games.`,
-      `${team}'s defensive structure has been elite lately, keeping games tight and favoring puck possession.`,
-      `Line movement since open has trended toward ${team} — sharp money agrees with this number.`
-    ]);
-    if(pickType === 'h2h') {
-      if(conf >= 75) return `${team} are a strong play ${loc} tonight. ${situational} ${sharpLine}`;
-      if(conf >= 65) return `${team} at ${formattedOdds} ${loc} is a solid play. ${homeNote} ${situational}`;
-      return `${team} at ${formattedOdds} offers value ${loc}. ${situational} At ${conf}% implied probability, this is a smart spot.`;
-    }
-    if(pickType === 'spreads') {
-      const sp = point > 0 ? `+${point}` : `${point}`;
-      if(conf >= 75) return `${team} ${sp} is one of the stronger puck line plays today. ${situational} ${sharpLine}`;
-      if(conf >= 65) return `${team} ${sp} at ${formattedOdds} is a solid play. ${homeNote} ${situational}`;
-      return `${team} ${sp} at ${formattedOdds} offers value. ${situational}`;
-    }
+
+    const openings = odds < 0 ? [
+      `${team} are favored ${loc} at ${formattedOdds} and the model has them as the right side tonight.`,
+      `The books opened ${team} as the favorite ${loc} and the model agrees — this number is right.`,
+      `${team} at ${formattedOdds} ${loc} is a clean number. The model has them as the more complete team tonight.`,
+      `Favored ${loc} at ${formattedOdds}, ${team} are one of the stronger plays on tonight's NHL slate.`,
+      `${team} come in as favorites ${loc} and everything the model sees points to backing them here.`
+    ] : [
+      `${team} are the underdog ${loc} at ${formattedOdds} but the model sees this game as much closer than the books do.`,
+      `The public is loading up on ${opponent} but ${team} at ${formattedOdds} is where the value lives tonight.`,
+      `${formattedOdds} on ${team} is a number that stands out — the model has them playing better than their price suggests.`,
+      `${team} at plus money ${loc} is a legitimate value play. The model doesn't see the gap the books are pricing in.`,
+      `Underdog spot for ${team} at ${formattedOdds} — and the model thinks the books have this one wrong.`
+    ];
+
+    const middles = [
+      `${team}'s goaltender has been one of the better options in the league over the last 10 games — the save percentage tells the real story.`,
+      `${opponent} is coming off a back-to-back and fatigue in the third period is a very real concern heading into this one.`,
+      `${team}'s power play has been clicking and ${opponent}'s penalty kill has been one of the leakier units in the league lately.`,
+      `${team} leads the league in shots on goal over the last two weeks — they've been generating and they've been converting.`,
+      `Defensive structure has been ${team}'s calling card lately — they keep games tight and force opponents into mistakes.`,
+      `${team} have been the more complete team over their last five games and ${opponent} has been inconsistent in all three zones.`,
+      `${opponent} has been giving up odd-man rushes at an alarming rate — ${team} are exactly the kind of team to make them pay.`,
+      `${team}'s depth up front has been the difference in close games — they can roll four lines and not lose a step.`,
+      `The goaltending matchup heavily favors ${team} tonight — their starter has been significantly sharper than ${opponent}'s recently.`,
+      `${team} have covered the puck line at a strong rate this season in spots exactly like this one. The situational edge is real.`,
+      `${opponent} has been dealing with injuries up front and their offensive depth has suffered — ${team}'s defense will eat tonight.`,
+      `${team} are built for this kind of game — tight, physical, low-event hockey is where they're at their most dangerous.`
+    ];
+
     if(pickType === 'totals') {
-      const overNotes = [
-        `Both teams have been involved in high-event games lately — expect pace, shots, and goals.`,
-        `Goaltending has been shaky on both sides recently — this total feels low given recent form.`,
-        `Penalty trouble for both squads sets up power play opportunities that tend to push totals higher.`
+      const dir = team;
+      const overMids = [
+        `Both ${team} and ${opponent} have been involved in high-event games lately — expect pace, special teams, and goals.`,
+        `Goaltending has been inconsistent on both sides recently. This total feels low for the matchup we're likely to get.`,
+        `Penalty trouble has been a theme for both teams — power play goals tend to push totals higher and both teams have the personnel to score on the man advantage.`,
+        `Both teams rank near the top in shots per game over the last two weeks. High volume leads to high scoring.`,
+        `${opponent} and ${team} have been combining for goals at a high rate in recent matchups. The under bettors have been getting burned.`
       ];
-      const underNotes = [
-        `Two of the sharper goaltenders in the league square off tonight — goals will be hard to come by.`,
-        `Both teams have been playing tight, defensive hockey lately. The under has cashed in their recent games.`,
-        `Slow-paced matchup expected — both coaches favor structure over run-and-gun. The under fits the profile.`
+      const underMids = [
+        `Two of the sharper goaltenders in the league going tonight — scoring chances are going to be hard to come by for both sides.`,
+        `${team} and ${opponent} have both been playing tight, defensive hockey lately. The under has cashed at a strong rate in their recent games.`,
+        `Both coaches favor structured, low-risk hockey and that tends to translate to low-scoring outcomes. The under fits the profile perfectly.`,
+        `Penalty discipline has been a strength for both teams lately — fewer power plays means fewer easy goals and that favors the under.`,
+        `Both teams are built to defend first and the offensive numbers back that up. This total looks a half-goal too high for what we're likely to get.`
       ];
-      return `${team} ${point} at ${formattedOdds}. ${rnd(team === 'Over' ? overNotes : underNotes)} ${sharpLine}`;
+      return `${rnd(openings)} ${rnd(dir === 'Over' ? overMids : underMids)} ${rnd(closings)}`;
     }
+
+    return `${rnd(openings)} ${rnd(middles)} ${rnd(closings)}`;
   }
 
-  // ── UFC ──────────────────────────────────────────────────────────────────────
+  // ── UFC ───────────────────────────────────────────────────────────────────
   if(sport === 'ufc') {
-    const oddsNote = odds < 0
-      ? `${team} is the favorite at ${formattedOdds} — the books see a clear edge here and our model agrees.`
-      : `${team} comes in as the underdog at ${formattedOdds}, but the value is there and the model likes this spot.`;
-    const styleNote = rnd([
-      `${team}'s striking accuracy and distance control give them a clear edge against ${opponent} in this matchup.`,
-      `The grappling and takedown defense for ${team} has been elite — ${opponent} will struggle to impose their game plan.`,
-      `${team} has looked sharp in recent outings, finishing opponents and showing no signs of slowing down heading into this fight.`,
-      `Style-wise, this is a favorable matchup for ${team} — ${opponent}'s tendencies play right into their strengths.`,
-      `${team} has been finishing fights lately — their pressure and aggression late in rounds has been the defining factor.`,
-      `Cardio and late-round performance is where ${team} separates — if this goes deep, it heavily favors them.`,
-      `${team}'s camp has clearly game-planned around ${opponent}'s tendencies — they're prepared for this fight.`,
-      `${opponent} has shown some defensive holes that ${team} is well-equipped to exploit on fight night.`
-    ]);
-    const closingNote = rnd([
-      `This line has moved toward ${team} since opening — sharp money is backing this pick.`,
-      sharpLine,
-      `Our model has ${team} as the more complete fighter heading into fight night.`,
-      `At ${conf}% implied probability, the model sees enough value to make this a confident play.`
-    ]);
-    return `${oddsNote} ${styleNote} ${closingNote}`;
+    const openings = odds < 0 ? [
+      `${team} is the betting favorite heading into fight night at ${formattedOdds} and the model agrees with that assessment.`,
+      `The books opened ${team} as the favorite and sharp money has only reinforced that line — that's meaningful.`,
+      `${team} is priced as a clear favorite at ${formattedOdds} and the model sees no reason to go against the grain here.`,
+      `At ${formattedOdds}, ${team} represent the right side. The implied probability lines up with what the model has.`,
+      `${team} comes in as the favorite on fight night and this is one of the cleaner plays on the card.`
+    ] : [
+      `${team} is the underdog at ${formattedOdds} but the model sees a genuine edge here that the books aren't fully pricing in.`,
+      `The public is fading ${team} but at ${formattedOdds} there's real value on this side — the model flagged it early.`,
+      `${formattedOdds} on ${team} is a number that stands out. The model has this fight much closer than the odds suggest.`,
+      `Underdog value on ${team} at ${formattedOdds} — the model sees a fighter who is being significantly underestimated here.`,
+      `${team} at plus money is a spot the model loves. The gap between talent and price is where edges are made.`
+    ];
+
+    const middles = [
+      `${team}'s striking accuracy and the ability to control distance and pace are going to be serious problems for ${opponent} in this fight.`,
+      `The grappling dimension heavily favors ${team} — ${opponent} has struggled against fighters who can dictate where the fight goes and ${team} absolutely can.`,
+      `${team} has looked sharper than ever in recent outings and the finishing ability has been on full display. ${opponent} hasn't faced that level of pressure.`,
+      `Style matchup analysis points clearly to ${team} — ${opponent}'s tendencies and defensive habits play right into ${team}'s strengths.`,
+      `${team} has been finishing fights and doing it convincingly. The cardio and the aggression in the late rounds have been the defining factors.`,
+      `If this fight goes to the championship rounds, ${team} wins that version of the fight decisively. The conditioning edge is real.`,
+      `${team}'s camp has put in the work to specifically prepare for ${opponent}'s game plan — this is not a fighter walking in blind.`,
+      `${opponent} has shown some clear defensive vulnerabilities in recent fights and ${team} has exactly the tools to expose them on fight night.`,
+      `The reach and frame advantage plays into ${team}'s hands — ${opponent} is going to have a hard time getting comfortable in this fight.`,
+      `${team} has been on an impressive run lately — finishing opponents, looking sharp, and showing real improvements in every area of the game.`,
+      `${opponent} tends to fade when the fight doesn't go their way early — ${team} has the experience and the composure to grind this one out.`,
+      `The mental edge matters in MMA and ${team} has been in bigger spots than ${opponent} has. Experience counts when it gets difficult.`
+    ];
+
+    const ufcClosings = [
+      `This line has moved toward ${team} since opening. Sharp money knows something the public doesn't.`,
+      `The model has ${team} as the more complete fighter and the edge shows up across multiple dimensions of this matchup.`,
+      `At ${conf}% implied probability, there's legitimate value here. The model is confident in this play.`,
+      `${bookmakerCount >= 5 ? 'Five or more sportsbooks' : 'Multiple books'} are aligned on this number — consensus is hard to ignore.`,
+      `This is a calculated, data-driven play. The model sees a clear edge and this is how you build long-term profit.`,
+      `Sharp bettors have been consistent on ${team} since the line opened. Follow the money on fight night.`
+    ];
+
+    return `${rnd(openings)} ${rnd(middles)} ${rnd(ufcClosings)}`;
   }
 
-  // ── Fallback ─────────────────────────────────────────────────────────────────
-  return `Strong play — ${conf}% confidence at ${formattedOdds}. ${sharpLine}`;
+  // ── Fallback ──────────────────────────────────────────────────────────────
+  return `Strong play — ${conf}% confidence at ${formattedOdds}. The model sees clear value on ${team} in this spot.`;
 }
 
 // ─── SAVE PICKS TO SUPABASE ───────────────────────────────────────────────────
@@ -657,9 +739,9 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
         type: 'totals', label: 'TOTAL', gameTime: game.commence_time,
         game: `${sportLabel} · ${game.away_team} @ ${game.home_team}`,
         name: `${direction} ${point}`,
-        odds, conf, valueScore, team: direction, opponent: '', point,
+        odds, conf, valueScore, team: direction, opponent: game.home_team, point,
         bookmakerCount: game.bookmakers.length,
-        analysis: generateAnalysis('totals', direction, '', conf, odds, point, false, sport, game.bookmakers.length, pitcherContext)
+        analysis: generateAnalysis('totals', direction, game.away_team, conf, odds, point, false, sport, game.bookmakers.length, pitcherContext)
       });
     });
   });
@@ -683,7 +765,7 @@ async function getPicksForSport(sportKey, sportLabel, sport) {
         if(!odds || !isGoodValue(odds, sport, 'ML')) return;
         const conf = Math.round(americanToImpliedProb(odds) * 100);
         if(conf < 55) return;
-        const key = `${sportLabel} · ${game.home_team} vs ${game.away_team}h2h`;
+        const key = `${sportLabel} · ${game.away_team} @ ${game.home_team}h2h`;
         if(existingKeys.has(key)) return;
         const isHome = team === game.home_team;
         const opponent = isHome ? game.away_team : game.home_team;
