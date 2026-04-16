@@ -611,7 +611,7 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
 // ─── SAVE PICKS TO SUPABASE ───────────────────────────────────────────────────
 async function saveAllPicks(allPicks) {
   if(!supabase) return;
-  const twelveHoursAgo = new Date(Date.now() - 12 * 60 * 60 * 1000).toISOString();
+  const twelveHoursAgo = new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString();
   for(const [sport, picks] of Object.entries(allPicks)) {
     if(!Array.isArray(picks)) continue;
     for(const pick of picks) {
