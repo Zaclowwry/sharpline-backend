@@ -7,7 +7,7 @@ const app = express();
 app.use(cors());
 
 const PORT = process.env.PORT || 3000;
-const ODDS_API_KEY = '2033e71d5b6784b9352bfa561db1a576';
+const ODDS_API_KEY = process.env.ODDS_API_KEY;
 const SUPABASE_URL = process.env.SUPABASE_URL || 'https://elwbxwzequrfucujhgsy.supabase.co';
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const STRIPE_SECRET_KEY = process.env.STRIPE_SECRET_KEY;
