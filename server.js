@@ -17,6 +17,7 @@ const supabase = SUPABASE_SECRET_KEY ? createClient(SUPABASE_URL, SUPABASE_SECRE
 
 const SPORTS = {
   nba: 'basketball_nba',
+  wnba: 'basketball_wnba',
   mlb: 'baseball_mlb',
   nhl: 'icehockey_nhl',
   ufc: 'mma_mixed_martial_arts'
@@ -24,6 +25,7 @@ const SPORTS = {
 
 const SPORT_LABELS = {
   nba: '🏀 NBA',
+  wnba: '🏀 WNBA',
   mlb: '⚾ MLB',
   nhl: '🏒 NHL',
   ufc: '🥊 UFC'
@@ -39,6 +41,7 @@ const NEXT_UFC_EVENT = {
 
 const CONFIDENCE_THRESHOLDS = {
   nba: 60,
+  wnba: 60,
   mlb: 65,
   nhl: 60,
   ufc: 55
@@ -46,6 +49,7 @@ const CONFIDENCE_THRESHOLDS = {
 
 const ML_ODDS_FILTERS = {
   nba: -150,
+  wnba: -150,
   mlb: -150,
   nhl: -200,
   ufc: -200
@@ -294,7 +298,7 @@ function calculateStats(picks) {
   const losses = total.filter(p => p.result === 'loss');
   const pushes = total.filter(p => p.result === 'push');
   const bySport = {};
-  ['nba','mlb','nhl','ufc'].forEach(sport => {
+  ['nba','wnba','mlb','nhl','ufc'].forEach(sport => {
     const sp = total.filter(p => p.sport === sport);
     const sw = sp.filter(p => p.result === 'win');
     bySport[sport] = { wins: sw.length, total: sp.length, rate: sp.length > 0 ? Math.round((sw.length / sp.length) * 100) : 0 };
@@ -393,7 +397,8 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
   ];
 
   // ── NBA ───────────────────────────────────────────────────────────────────
-  if(sport === 'nba') {
+  if(sport === 'nba' || sport === 'wnba') {
+    const isWNBA = sport === 'wnba';
     const loc = isHome ? 'at home' : 'on the road';
 
     const openings = odds < 0 ? [
@@ -410,7 +415,20 @@ function generateAnalysis(pickType, team, opponent, conf, odds, point, isHome, s
       `Underdog alert — ${team} at ${formattedOdds} ${loc} is a genuine value play, not a dart throw.`
     ];
 
-    const middles = [
+    const middles = isWNBA ? [
+      `${team} have been one of the more consistent sides in the league and ${opponent} hasn't shown the ability to slow them down.`,
+      `Rest and scheduling favor ${team} heading into tonight — ${opponent} is the more fatigued team.`,
+      `${team}'s offense has been clicking at a high level and ${opponent}'s defense hasn't been able to stop teams playing this style.`,
+      `Back-to-back fatigue is a real concern for ${opponent} tonight. ${team} are fresh and ready to take advantage.`,
+      `The pace of this matchup suits ${team} perfectly — they've thrived in games played at this tempo all season.`,
+      `${opponent} has been giving up points at an alarming rate and ${team} are exactly the kind of team to exploit that.`,
+      `${team} have been significantly better in close games this season — composure and coaching give them the edge late.`,
+      `${opponent} has been inconsistent offensively and ${team}'s defense is built to make life difficult for exactly that kind of team.`,
+      `The matchup heavily favors ${team} — their personnel advantages are real and the model is pricing them accordingly.`,
+      `${team} have gone on extended runs in recent games and ${opponent} hasn't shown the discipline to slow that down.`,
+      `Key contributors for ${team} are healthy and available — depth is a real advantage heading into tonight.`,
+      `${team} have covered consistently against teams at this level. The trend is there and the model agrees.`
+    ] : [
       `${team} have been one of the more consistent teams over their last stretch of games and ${opponent} hasn't shown the ability to slow them down.`,
       `Rest and scheduling favor ${team} heading into tonight — ${opponent} is the more fatigued side.`,
       `${team}'s offense has been clicking at a high level lately and ${opponent}'s defense hasn't been able to stop teams with a similar style.`,
