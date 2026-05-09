@@ -8,6 +8,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_SECRET_KEY);
 
 const SCORES_SPORTS = {
   nba: 'basketball_nba',
+  wnba: 'basketball_wnba',
   mlb: 'baseball_mlb',
   nhl: 'icehockey_nhl'
 };
